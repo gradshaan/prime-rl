@@ -37,9 +37,6 @@ class PerfCounter:
             self.gpu_peak_flops = self._get_peak_flops(torch.cuda.get_device_name(torch.device("cuda")))
         else:
             self.gpu_peak_flops = 0
-        # If not tie_word_embeddings, we exclude the embedding parameters from the total number of parameters
-        # If tie_word_embeddings, the embedding parameters are already excluded (shared with the LM head)
-        self.num_params = self._get_num_params(model, exclude_embedding=not model.config.tie_word_embeddings)
         self.num_flop_per_token = self._get_num_flop_per_token(model.config, seq_len=seq_len)
 
     def count_tokens(self, tokens: int) -> None:
@@ -89,8 +86,14 @@ class PerfCounter:
                 return 756e12
             else:  # For H100 SXM and other variants
                 return 989e12
-        if "B200" in device_name:
+        if "GB200" in device_name or "GB300" in device_name:
+            # Grace Blackwell Superchips, dense BF16 per GPU: 2,500 TFLOPS
+            # https://www.nvidia.com/en-us/data-center/dgx-gb200/
+            # https://www.nvidia.com/en-us/data-center/dgx-gb300/
+            return 2.5e15
+        if "B200" in device_name or "B300" in device_name:
             # https://nvdam.widen.net/s/wwnsxrhm2w/blackwell-datasheet-3384703
+            # Checked after GB200/GB300 to avoid false match on "GB300"
             return 2.25e15  # This is half of the FLOPS reported in torchtitan
         # AMD Instinct GPUs
         if "MI300X" in device_name:
@@ -208,23 +211,6 @@ class PerfCounter:
             flop_per_token = 6 * self.get_active_mm_params(model_config) + attention_flops
 
         return flop_per_token
-
-    def _get_num_params(self, model: nn.Module, exclude_embedding: bool = False) -> int:
-        num_params = sum(p.numel() for p in model.parameters())
-        if exclude_embedding:
-            if hasattr(model.lm_head, "weight"):
-                num_params -= model.lm_head.weight.numel()
-            elif hasattr(model.lm_head, "base_layer"):  # MultiLoRAModule
-                num_params -= model.lm_head.base_layer.weight.numel()
-        return num_params
-
-    def _count_trainable_params(self) -> int:
-        """Count trainable parameters (LoRA adapters + modules_to_save)."""
-        trainable_params = 0
-        for param in self.model.parameters():
-            if param.requires_grad:
-                trainable_params += param.numel()
-        return trainable_params
 
     def _count_lora_adapter_params(self) -> int:
         """Count LoRA adapter parameters (sum of lora_A and lora_B across all MultiLoRAModules)."""

@@ -1,29 +1,63 @@
+import json
+import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
-
-import tomli_w
+from threading import Event, Thread
+from typing import Any
 
 from prime_rl.configs.inference import InferenceConfig
-from prime_rl.utils.config import cli
+from prime_rl.utils.config import cli, dump_resolved_config
 from prime_rl.utils.logger import setup_logger
-from prime_rl.utils.pathing import format_log_message, get_config_dir, get_log_dir
-from prime_rl.utils.process import set_proc_title
+from prime_rl.utils.pathing import (
+    format_log_message,
+    get_launcher_dir,
+    get_launcher_log_dir,
+    prepare_attempt_dirs,
+    write_launch_artifacts,
+)
+from prime_rl.utils.process import (
+    DEFAULT_COMMON_ENV_VARS,
+    DEFAULT_INFERENCE_ENV_VARS,
+    cleanup_processes,
+    set_proc_title,
+)
 
-INFERENCE_TOML = "inference.toml"
+INFERENCE_CONFIG = "inference.json"
 INFERENCE_SBATCH = "inference.sbatch"
 
 
-def write_config(config: InferenceConfig, output_dir: Path, exclude: set[str] | None = None) -> Path:
-    """Write resolved config to disk."""
+def vllm_overrides_fragment(overrides: dict[str, Any]) -> str:
+    """Render per-role vLLM overrides as a JSON fragment for the ROLE_EXTRA bash string.
+
+    Returns a leading-comma fragment with quotes escaped for the double-quoted assignment
+    (e.g. `, \\"max_num_seqs\\": 256`), or an empty string when there are no overrides.
+    """
+    if not overrides:
+        return ""
+    return ", " + json.dumps(overrides)[1:-1].replace('"', '\\"')
+
+
+def write_config(
+    config: InferenceConfig, output_dir: Path, exclude: set[str] | None = None, engine_only: bool = False
+) -> Path:
+    """Write resolved config to disk.
+
+    With ``engine_only``, the router is nulled so per-rank processes run bare
+    engines — the sbatch script starts the single global router.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
-    config_path = output_dir / INFERENCE_TOML
-    with open(config_path, "wb") as f:
-        tomli_w.dump(config.model_dump(exclude=exclude, exclude_none=True, mode="json"), f)
+    config_path = output_dir / INFERENCE_CONFIG
+    config_dict = dump_resolved_config(config, exclude=exclude)
+    if engine_only:
+        config_dict["router"] = None
+    with open(config_path, "w") as f:
+        json.dump(config_dict, f, indent=2)
     return config_path
 
 
-def write_slurm_script(config: InferenceConfig, config_path: Path, script_path: Path) -> None:
+def write_slurm_script(config: InferenceConfig, config_path: Path, log_dir: Path, script_path: Path) -> None:
     """Write the SLURM script to disk."""
     from jinja2 import Environment, FileSystemLoader
 
@@ -34,18 +68,31 @@ def write_slurm_script(config: InferenceConfig, config_path: Path, script_path: 
     template = env.get_template(config.slurm.template_path.name)
 
     is_disaggregated = config.deployment.type == "disaggregated"
-    dp_per_node = config.deployment.gpus_per_node // config.parallel.tp
+    dp_per_node = config.deployment.gpus_per_node // config.vllm.tensor_parallel_size
+
+    offload = config.kv_cache_offload
+    is_mooncake = offload is not None and offload.type == "mooncake"
 
     template_vars = dict(
         **config.slurm.template_vars,
         config_path=config_path,
+        config_dir=config_path.parent,
+        log_dir=log_dir,
         output_dir=config.output_dir,
+        launcher_log_dir=get_launcher_log_dir(config.output_dir),
         gpus_per_node=config.deployment.gpus_per_node,
         dp_per_node=dp_per_node,
         num_nodes=getattr(config.deployment, "num_nodes", 1),
         port=config.server.port,
-        disaggregated=is_disaggregated,
-        kv_offload=config.kv_cache_offload is not None,
+        router=config.router,
+        router_port=config.server.port,
+        is_disaggregated=is_disaggregated,
+        kv_offload=offload is not None,
+        kv_offload_mooncake=is_mooncake,
+        kv_offload_cpu_bytes=int(offload.cpu.num_bytes) if is_mooncake else 0,
+        kv_offload_disk_path=str(offload.disk.path) if (is_mooncake and offload.disk is not None) else "",
+        kv_offload_device_name=offload.device_name if is_mooncake else "",
+        inference_env_vars={**DEFAULT_COMMON_ENV_VARS, **DEFAULT_INFERENCE_ENV_VARS, **config.env_vars},
     )
 
     is_multi_node = config.deployment.type == "multi_node"
@@ -54,28 +101,31 @@ def write_slurm_script(config: InferenceConfig, config_path: Path, script_path: 
         template_vars.update(
             num_prefill_nodes=config.deployment.num_prefill_nodes,
             num_decode_nodes=config.deployment.num_decode_nodes,
+            prefill_nodes_per_replica=config.deployment.prefill_nodes_per_replica,
+            decode_nodes_per_replica=config.deployment.decode_nodes_per_replica,
             num_prefill_replicas=config.deployment.num_prefill_replicas,
             num_decode_replicas=config.deployment.num_decode_replicas,
             prefill_port=config.deployment.prefill_port,
             decode_port=config.deployment.decode_port,
-            router_port=config.deployment.router_port,
-            router_policy=config.deployment.router_policy,
-            data_parallel_rpc_port=config.data_parallel_rpc_port,
+            data_parallel_rpc_port=config.vllm.data_parallel_rpc_port,
             use_deep_gemm=config.use_deep_gemm,
-            prefill_env_overrides=config.deployment.prefill_env_overrides,
-            decode_env_overrides=config.deployment.decode_env_overrides,
-            kv_offload_cpu_bytes=int(config.kv_cache_offload.cpu_bytes) if config.kv_cache_offload else 0,
+            prefill_env_vars=config.deployment.prefill_env_vars,
+            decode_env_vars=config.deployment.decode_env_vars,
+            prefill_vllm_extra_json=vllm_overrides_fragment(config.deployment.prefill_vllm_overrides),
+            decode_vllm_extra_json=vllm_overrides_fragment(config.deployment.decode_vllm_overrides),
         )
     elif is_multi_node:
         template_vars.update(
-            router_port=config.deployment.router_port,
-            backend_port=config.deployment.backend_port,
-            router_policy=config.deployment.router_policy,
+            backend_port=config.backend_port,
+            data_parallel_rpc_port=config.vllm.data_parallel_rpc_port,
+            enable_expert_parallel=config.vllm.enable_expert_parallel,
+            infer_nodes_per_replica=config.deployment.num_nodes,
         )
 
     script = template.render(**template_vars)
 
     script_path.parent.mkdir(parents=True, exist_ok=True)
+    get_launcher_log_dir(config.output_dir).mkdir(parents=True, exist_ok=True)
     script_path.write_text(script)
 
 
@@ -83,22 +133,19 @@ def inference_slurm(config: InferenceConfig):
     """Run inference via SLURM."""
     assert config.slurm is not None
 
-    logger = setup_logger("info")
+    logger = setup_logger(config.log.level, json_logging=config.log.json_logging)
 
-    config_dir = get_config_dir(config.output_dir)
-    exclude = (
-        {"deployment", "slurm", "dry_run"}
-        if config.deployment.type in ("multi_node", "disaggregated")
-        else {"slurm", "dry_run"}
-    )
-    config_path = write_config(config, config_dir, exclude=exclude)
+    config_dir, log_dir = prepare_attempt_dirs(config.output_dir)
+    write_launch_artifacts(config_dir, "inference")
+    is_multi_node = config.deployment.type in ("multi_node", "disaggregated")
+    exclude = {"deployment", "slurm", "dry_run"} if is_multi_node else {"slurm", "dry_run"}
+    config_path = write_config(config, config_dir, exclude=exclude, engine_only=is_multi_node)
     logger.info(f"Wrote config to {config_path}")
 
-    script_path = config.output_dir / INFERENCE_SBATCH
-    write_slurm_script(config, config_path, script_path)
+    script_path = get_launcher_dir(config.output_dir) / INFERENCE_SBATCH
+    write_slurm_script(config, config_path, log_dir, script_path)
     logger.info(f"Wrote SLURM script to {script_path}")
 
-    log_dir = get_log_dir(config.output_dir)
     num_nodes = getattr(config.deployment, "num_nodes", 1)
     log_message = format_log_message(log_dir=log_dir, inference=True, job_log=True, num_infer_nodes=num_nodes)
 
@@ -115,11 +162,40 @@ def inference_slurm(config: InferenceConfig):
     logger.success(f"{result.stdout.strip()}\n\n{log_message}")
 
 
+def start_router(config: InferenceConfig) -> subprocess.Popen:
+    """Start the vllm-router on ``server.port``, fronting the local engine at ``backend_port``."""
+    assert config.router is not None and config.router.type == "vllm-router"
+    host = config.server.host
+    worker_host = "localhost" if host in (None, "0.0.0.0") else host
+    cmd = [
+        "vllm-router",
+        "--policy",
+        config.router.policy,
+        "--host",
+        host or "0.0.0.0",
+        "--port",
+        str(config.server.port),
+        "--worker-urls",
+        f"http://{worker_host}:{config.backend_port}",
+        "--intra-node-data-parallel-size",
+        str(config.vllm.data_parallel_size_local or config.vllm.data_parallel_size),
+        "--request-id-headers",
+        "x-session-id",
+        "--request-timeout-secs",
+        str(config.router.request_timeout_secs),
+        "--worker-startup-timeout-secs",
+        "4200",
+        "--prometheus-port",
+        str(config.server.port + 21000),
+    ]
+    return subprocess.Popen(cmd)
+
+
 def inference_local(config: InferenceConfig):
-    """Run inference locally."""
+    """Run inference locally: a router on ``server.port`` fronting the engine on ``backend_port``."""
     from prime_rl.inference.server import setup_vllm_env
 
-    logger = setup_logger("info")
+    logger = setup_logger(config.log.level, json_logging=config.log.json_logging)
 
     if config.dry_run:
         logger.success("Dry run complete. To start inference locally, remove --dry-run from your command.")
@@ -127,13 +203,40 @@ def inference_local(config: InferenceConfig):
 
     host = config.server.host or "0.0.0.0"
     port = config.server.port
-    logger.info(f"Starting inference on http://{host}:{port}/v1\n")
+
+    # Apply the inference env (defaults + [inference.env_vars]) in-process so a standalone
+    # `uv run inference` gets the same environment the rl/SLURM launchers inject into the
+    # server subprocess. config.env_vars wins over the defaults; existing os.environ loses.
+    os.environ.update({**DEFAULT_COMMON_ENV_VARS, **DEFAULT_INFERENCE_ENV_VARS, **config.env_vars})
 
     setup_vllm_env(config)
 
+    router_process: subprocess.Popen | None = None
+    router_stopping = Event()
+    if config.router is not None:
+        logger.info(f"Starting router on http://{host}:{port}/v1 (engine on port {config.backend_port})\n")
+        router_process = start_router(config)
+        # The router owns the client-facing port; the engine moves behind it.
+        config.server.port = config.backend_port
+
+        def watch_router():
+            router_process.wait()
+            if not router_stopping.is_set():
+                logger.error(f"Router exited with code {router_process.returncode} - shutting down")
+                os.kill(os.getpid(), signal.SIGTERM)
+
+        Thread(target=watch_router, daemon=True).start()
+    else:
+        logger.info(f"Starting inference on http://{host}:{port}/v1\n")
+
     from prime_rl.inference.vllm.server import server  # pyright: ignore
 
-    server(config, vllm_extra=config.vllm_extra)
+    try:
+        server(config)
+    finally:
+        if router_process is not None:
+            router_stopping.set()
+            cleanup_processes([router_process])
 
 
 def inference(config: InferenceConfig):

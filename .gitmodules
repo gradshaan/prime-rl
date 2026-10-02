@@ -4,12 +4,12 @@
 [submodule "renderers"]
 	path = deps/renderers
 	url = git@github.com:PrimeIntellect-ai/renderers.git
-[submodule "research-environments"]
-	path = deps/research-environments
-	url = git@github.com:PrimeIntellect-ai/research-environments.git
-[submodule "configs/private"]
-	path = configs/private
-	url = git@github.com:PrimeIntellect-ai/research-configs.git
+[submodule "prime-envs"]
+	path = deps/prime-envs
+	url = git@github.com:PrimeIntellect-ai/prime-envs.git
 [submodule "pydantic-config"]
 	path = deps/pydantic-config
 	url = https://github.com/PrimeIntellect-ai/pydantic-config
+[submodule "prime-kernels"]
+	path = deps/prime-kernels
+	url = https://github.com/PrimeIntellect-ai/prime-kernels

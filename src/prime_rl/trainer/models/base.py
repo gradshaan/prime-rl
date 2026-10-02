@@ -1,5 +1,21 @@
+from dataclasses import dataclass
+from typing import Literal
+
 from torch import Tensor
 from transformers.modeling_utils import PreTrainedModel
+
+from prime_rl.utils.cp import CPContext
+
+CPStyle = Literal["ring", "ulysses"]
+ALL_CP_STYLES: frozenset[CPStyle] = frozenset({"ring", "ulysses"})
+
+
+@dataclass(frozen=True)
+class CPSupport:
+    """Which context-parallel styles an architecture can train under, and why not the rest."""
+
+    styles: frozenset[CPStyle]
+    reason: str = ""
 
 
 class PreTrainedModelPrimeRL(PreTrainedModel):
@@ -11,8 +27,28 @@ class PreTrainedModelPrimeRL(PreTrainedModel):
     after loading with meta device.
     """
 
+    cp_context: CPContext = CPContext()
+
     @classmethod
-    def from_config(cls, config, **kwargs):
+    def cp_support(cls, config) -> CPSupport:
+        """CP styles this architecture supports, given its config.
+
+        Softmax attention runs through the shared ``FlashAttention._compute_attention``, which both
+        ``substitute_ring_attn`` and ``substitute_ulysses_attn`` rebind, so the default is both styles.
+        Architectures whose attention sits outside that path declare their own support.
+        """
+        return CPSupport(ALL_CP_STYLES)
+
+    @classmethod
+    def keep_in_fp32_for_weight_transfer(cls, name: str) -> bool:
+        """Whether a tensor is stored in FP32 in the source checkpoint.
+
+        Runtime upcasts for training or inference do not change the wire dtype.
+        """
+        return False
+
+    @classmethod
+    def from_config(cls, config, trust_remote_code: bool = False, **kwargs):
         """Public from_config that mirrors the Auto class API."""
         return cls._from_config(config, **kwargs)
 
@@ -20,6 +56,22 @@ class PreTrainedModelPrimeRL(PreTrainedModel):
     def _can_set_experts_implementation(cls) -> bool:
         """PrimeRL models use custom MoE implementations and don't support dynamic experts implementation."""
         return False
+
+    def _check_and_adjust_attn_implementation(
+        self, attn_implementation: str | None, is_init_check: bool = False, allow_all_kernels: bool = False
+    ) -> str:
+        """Bypass transformers' flash attention availability checks.
+
+        PrimeRL custom models dispatch attention through their own ``ATTN_IMPL2CLASS``
+        dictionaries, not through transformers' ``ALL_ATTENTION_FUNCTIONS``.  The default
+        ``_check_and_adjust_attn_implementation`` validates that the requested flash
+        attention package is installed and the device is supported, which fails on
+        CPU-only machines and is unnecessary because we never call transformers'
+        attention dispatch for custom models.
+        """
+        if attn_implementation is None:
+            attn_implementation = "flash_attention_3"
+        return attn_implementation
 
     def get_correct_experts_implementation(self, requested_experts: str | None) -> str:
         """PrimeRL models always use eager experts implementation."""
@@ -52,56 +104,29 @@ class PreTrainedModelPrimeRL(PreTrainedModel):
         raise NotImplementedError(f"is_prime_state_dict is not implemented for {cls.__name__}")
 
     @classmethod
-    def convert_to_hf(cls, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
-        """
-        Convert state dict from PrimeRL training format to HuggingFace format in-place.
+    def conversion_chain(cls, config) -> list:
+        """Declarative operations converting between HF and PrimeRL state dicts."""
+        return []
 
-        This is used when saving checkpoints or broadcasting weights to inference engines
-        that expect HuggingFace-compatible format.
+    def convert_to_hf(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Convert a PrimeRL state dict to HuggingFace format in-place."""
+        from prime_rl.trainer.models.conversion_ops import apply_prime_to_hf
 
-        Args:
-            state_dict: The state dict to convert (modified in-place).
-        """
-        raise NotImplementedError(f"convert_to_hf is not implemented for {cls.__name__}")
+        return apply_prime_to_hf(state_dict, self.conversion_chain(self.config))
 
-    @classmethod
-    def convert_to_prime(cls, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
-        """
-        Convert state dict from HuggingFace format to PrimeRL training format in-place.
+    def convert_to_prime(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Convert a HuggingFace state dict to PrimeRL format in-place."""
+        from prime_rl.trainer.models.conversion_ops import apply_hf_to_prime
 
-        This is used when loading pretrained HuggingFace models for training with
-        PrimeRL-specific optimizations.
+        return apply_hf_to_prime(state_dict, self.conversion_chain(self.config))
 
-        Args:
-            state_dict: The state dict to convert (modified in-place).
-        """
-        raise NotImplementedError(f"convert_to_prime is not implemented for {cls.__name__}")
+    def convert_layer_to_hf(self, state_dict: dict[str, Tensor], layer_idx: int) -> dict[str, Tensor]:
+        """Convert one layer from PrimeRL to HuggingFace format in-place."""
+        return self.convert_to_hf(state_dict)
 
-    @classmethod
-    def convert_layer_to_hf(cls, state_dict: dict[str, Tensor], layer_idx: int) -> dict[str, Tensor]:
-        """
-        Convert a single layer's state dict from PrimeRL format to HuggingFace format in-place.
-
-        This is used for layer-by-layer conversion during NCCL broadcast to reduce memory usage.
-
-        Args:
-            state_dict: The state dict containing the layer to convert (modified in-place).
-            layer_idx: The index of the layer to convert.
-        """
-        raise NotImplementedError(f"convert_layer_to_hf is not implemented for {cls.__name__}")
-
-    @classmethod
-    def convert_layer_to_prime(cls, state_dict: dict[str, Tensor], layer_idx: int) -> dict[str, Tensor]:
-        """
-        Convert a single layer's state dict from HuggingFace format to PrimeRL format in-place.
-
-        This is used for layer-by-layer conversion during loading.
-
-        Args:
-            state_dict: The state dict containing the layer to convert (modified in-place).
-            layer_idx: The index of the layer to convert.
-        """
-        raise NotImplementedError(f"convert_layer_to_prime is not implemented for {cls.__name__}")
+    def convert_layer_to_prime(self, state_dict: dict[str, Tensor], layer_idx: int) -> dict[str, Tensor]:
+        """Convert one layer from HuggingFace to PrimeRL format in-place."""
+        return self.convert_to_prime(state_dict)
 
     @classmethod
     def convert_adapter_to_hf(cls, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
@@ -118,23 +143,6 @@ class PreTrainedModelPrimeRL(PreTrainedModel):
         """
         return state_dict
 
-    @classmethod
-    def convert_layer_to_vllm_kernel(
-        cls,
-        state_dict: dict[str, Tensor],
-        layer_idx: int,
-        quantize_fp8: bool = False,
-    ) -> dict[str, Tensor]:
-        """
-        Convert a single layer's state dict from PrimeRL format to vLLM kernel format.
-
-        Args:
-            state_dict: Layer weights in PrimeRL format.
-            layer_idx: Layer index to convert.
-            quantize_fp8: Whether to emit FP8 (e4m3) kernel weights with per-block scales.
-        """
-        raise NotImplementedError(f"convert_layer_to_vllm_kernel is not implemented for {cls.__name__}")
-
     def init_buffers_post_meta(self) -> None:
         """
         Initialize buffers that are not in the state dict after loading with meta device.
@@ -148,4 +156,4 @@ class PreTrainedModelPrimeRL(PreTrainedModel):
         raise NotImplementedError(f"init_buffers_post_meta is not implemented for {self.__class__.__name__}")
 
 
-__all__ = ["PreTrainedModelPrimeRL"]
+__all__ = ["ALL_CP_STYLES", "CPStyle", "CPSupport", "PreTrainedModelPrimeRL"]

@@ -1,327 +1,182 @@
+"""Env wrappers over a v1 env server.
+
+Each ``Env`` is an ``EnvClient`` onto its source's env server. Each server's address
+is derived from the source's position in the config
+(``OrchestratorConfig.env_addresses``); the launcher runs the servers at
+exactly those addresses, and the orchestrator connects. The
+orchestrator never *runs* an environment — the agents and their runtimes live only
+in the server — but it does own the *taskset*: a v1 env's tasks are loaded here,
+once, and each dispatched episode ships its task's data on the request
+(``task_data``); the server pydantic-validates it into the taskset's declared
+``TaskData`` type and runs it. That keeps the server (and every worker in its
+pool) stateless about data — no per-worker dataset loads, no idx-addressed task
+cache — and gives the orchestrator real tasks to sample.
+
+The server answers one ``Episode`` per run request, whose traces we validate into
+``Trace[WireTaskData]`` — real ``vf.Trace``\\ s (never loose dicts) whose task
+keeps the env's task-specific fields as extras (``WireTaskData`` allows them).
+"""
+
 from __future__ import annotations
 
 import asyncio
-import atexit
-import multiprocessing as mp
 import time
-from collections.abc import Awaitable, Callable, Iterator, Sequence
-from multiprocessing.process import BaseProcess
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Generic, TypeVar
 
-import pandas as pd
-import verifiers as vf
-from verifiers.serve import ZMQEnvClient, ZMQEnvServer
-from verifiers.utils.serve_utils import get_free_port
+import verifiers.v1 as vf
+from verifiers.v1.serve import EnvClient
 
-from prime_rl.configs.orchestrator import EnvConfig, EvalEnvConfig, TrainEnvConfig
-from prime_rl.orchestrator.eval_utils import compute_pass_at_k
-from prime_rl.orchestrator.vf_utils import get_completion_len
-from prime_rl.utils.logger import ProgressTracker, get_logger
-from prime_rl.utils.monitor import get_monitor
-from prime_rl.utils.utils import capitalize
+from prime_rl.configs.orchestrator import EnvConfig, EvalSourceConfig, TrainSourceConfig
+from prime_rl.orchestrator.algo import Algorithm, build_algorithm
+from prime_rl.orchestrator.generation_source import GenerationSource
+from prime_rl.utils.logger import format_time, get_logger
+from prime_rl.utils.pathing import env_address_file
 
-REQUIRED_STATE_COLUMNS = ["trajectory", "sampling_args"]
+# Max wait for the env server to answer health. Generous because the launcher spawns
+# servers concurrently with the orchestrator, and a server imports its env package
+# before serving.
+ENV_SERVER_STARTUP_TIMEOUT = 600.0
+
+
+async def wait_for_address(path: Path, timeout: float) -> str:
+    """The address a launcher-managed env server published, polling for the file the
+    server writes once it has bound (it starts concurrently with this process)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if address := path.read_text().strip():
+                return address
+        except FileNotFoundError:
+            pass
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"env server never published its address to {path} within {timeout}s")
+        await asyncio.sleep(0.5)
 
 
 class Env:
-    """Wraps a vf.Environment - only exposes features used in PRIME-RL."""
+    """Client onto a v1 env server. The orchestrator owns the taskset (loaded once,
+    client-side); the server owns agent/harness execution."""
 
-    def __init__(self, config: EnvConfig):
+    def __init__(self, config: EnvConfig, address: str | None, address_file: Path):
         self.config = config
+        self.address = address
+        self.address_file = address_file
+        """Where a launcher-managed server publishes its address; read when ``address``
+        is None."""
         self.sampling_args: dict = {}
-
-        get_logger().info(f"Initializing {config.resolved_name} ({config})")
-        self._env: vf.Environment = vf.load_environment(config.stripped_id, **config.args)
-        self._env_client: ZMQEnvClient | None = None
-        self._env_server_process: BaseProcess | None = None
+        self.num_tasks: int | None = 0
+        """Task count; ``None`` means the selected tasks never end."""
+        self.tasks: Iterator[vf.Task] | None = None
+        """The env's selected tasks (``select``), client-side, set at
+        ``start()``. A bounded selection is materialized (``num_tasks`` is its count)
+        and iterated from there; an unbounded one streams off the taskset. Consumed once — by ``TrainSource`` (train) or
+        ``EvalEnv.start`` (eval)."""
+        self._env_client: EnvClient | None = None
 
     @property
     def name(self) -> str:
         return self.config.resolved_name
 
     @property
-    def env(self) -> vf.Environment:
-        return self._env
-
-    @property
-    def env_client(self) -> ZMQEnvClient:
-        if not self._env_client:
-            raise RuntimeError(
-                f"Env {self.name} has no env client connected. Call connect() first to connect to an env server."
-            )
+    def env_client(self) -> EnvClient:
+        if self._env_client is None:
+            raise RuntimeError(f"Env {self.name} not started — call start() first.")
         return self._env_client
 
-    @property
-    def requires_group_scoring(self) -> bool:
-        return any(self.env.rubric._is_group_func(func) for func in self.env.rubric._get_reward_funcs())
-
-    async def start(
-        self,
-        log_dir: Path,
-        log_level: str | None = None,
-        json_logging: bool = False,
-    ) -> None:
-        """Spawn an env server (if needed) and connect to it."""
-        if self.config.address is None:
-            address = self._spawn(log_dir=log_dir, log_level=log_level, json_logging=json_logging)
+    async def start(self) -> None:
+        """Connect to the env server and load the taskset client-side."""
+        t0 = time.perf_counter()
+        if self.address is None:
+            self.address = await wait_for_address(self.address_file, timeout=ENV_SERVER_STARTUP_TIMEOUT)
+        get_logger().debug(f"Connecting {self.name} to env server {self.address}")
+        self._env_client = EnvClient(address=self.address)
+        # The server may still be coming up (the launcher spawns it concurrently with
+        # the orchestrator), so poll until it answers.
+        await self.env_client.wait_for_server_startup(timeout=ENV_SERVER_STARTUP_TIMEOUT)
+        taskset = vf.load_taskset(self.config.env.taskset).select(self.config.select)
+        if taskset.bounded:
+            # Materialize off the event loop — iterating may pull a dataset.
+            materialized = await asyncio.to_thread(lambda: list(taskset))
+            self.tasks = iter(materialized)
+            self.num_tasks = len(materialized)
         else:
-            address = self.config.address
-        get_logger().debug(f"Connecting {self.name} to env server {address}")
-        self._env_client = ZMQEnvClient(address=address, name=self.name)
-        await self.env_client.wait_for_server_startup()
+            self.tasks = iter(taskset)
+            self.num_tasks = None
+        num_tasks = self.num_tasks if self.num_tasks is not None else "infinite"
+        get_logger().info(f"Env {self.name} ready in {format_time(time.perf_counter() - t0)} (num_tasks={num_tasks})")
 
-    def _spawn(
-        self,
-        log_dir: Path,
-        log_level: str | None = None,
-        json_logging: bool = False,
-    ) -> str:
-        assert isinstance(self.config.num_workers, int), (
-            f"num_workers must be resolved before spawn, got {self.config.num_workers!r}"
-        )
-        num_workers = self.config.num_workers
-        address = f"tcp://127.0.0.1:{get_free_port()}"
-        get_logger().debug(f"Spawning env server {self.name} ({address=}, {num_workers=})")
-        process = mp.get_context("spawn").Process(
-            target=ZMQEnvServer.run_server,
-            args=(
-                self.config.stripped_id,
-                self.config.args,
-                self.config.extra_env_kwargs,
-                log_level,
-                (log_dir / self.name).as_posix(),
-            ),
-            kwargs=dict(
-                address=address,
-                json_logging=json_logging,
-                console_logging=False,
-                num_workers=num_workers,
-            ),
-            daemon=False,
-        )
-        process.start()
-        self._env_server_process = process
-        return address
+    def _sampling(self, cache_salt: str | None) -> vf.SamplingConfig:
+        sampling = {**self.sampling_args}
+        if cache_salt is not None:
+            sampling["extra_body"] = {**sampling.get("extra_body", {}), "cache_salt": cache_salt}
+        return vf.SamplingConfig(**sampling)
 
-    def _sampling_args_with_salt(self, cache_salt: str) -> dict:
-        sampling_args = {**self.sampling_args}
-        extra_body = {**sampling_args.get("extra_body", {}), "cache_salt": cache_salt}
-        sampling_args["extra_body"] = extra_body
-        return sampling_args
-
-    @property
-    def state_columns(self) -> list[str]:
-        """Required columns plus any extras configured on the env, deduped (required first)."""
-        merged: list[str] = []
-        for col in (*REQUIRED_STATE_COLUMNS, *self.config.state_columns):
-            if col not in merged:
-                merged.append(col)
-        return merged
-
-    async def run_rollout(
+    async def run(
         self,
         client: vf.ClientConfig,
-        example: dict,
         model_name: str,
-        cache_salt: str,
-    ) -> vf.RolloutOutput:
-        """Run a single rollout for an example."""
-        return await self.env.run_rollout(
-            vf.RolloutInput(**example),
+        cache_salt: str | None,
+        task_data: dict,
+        on_delta: Callable[[dict], None] | None = None,
+    ) -> vf.WireEpisode:
+        """Run and return one typed episode. A failed multi-trace episode marks
+        its otherwise-clean traces failed so partial episodes never train.
+        ``on_delta`` sees each delta of the env server's stream — a turn or a phase
+        change of one of the episode's traces — as it lands."""
+        episode = await self.env_client.run(
+            task_data=task_data,
             client=client,
             model=model_name,
-            sampling_args=self._sampling_args_with_salt(cache_salt),
-            max_retries=self.config.max_retries,
-            state_columns=self.state_columns,
-            env_client=self.env_client,
+            sampling=self._sampling(cache_salt),
+            on_delta=on_delta,
         )
-
-    async def run_group(
-        self,
-        client: vf.ClientConfig,
-        example: dict,
-        model_name: str,
-        group_size: int,
-        cache_salt: str,
-    ) -> list[vf.RolloutOutput]:
-        """Run a group of rollouts for an example. Required for group-scoring envs."""
-        return await self.env.run_group(
-            [vf.RolloutInput(**example) for _ in range(group_size)],
-            client=client,
-            model=model_name,
-            sampling_args=self._sampling_args_with_salt(cache_salt),
-            max_retries=self.config.max_retries,
-            state_columns=self.state_columns,
-            env_client=self.env_client,
-        )
-
-    def shutdown(self) -> None:
-        if self._env_server_process is None:
-            return
-        self._env_server_process.terminate()
-        self._env_server_process = None
+        for trace in episode.traces:
+            if not episode.ok and trace.ok:
+                error = episode.last_error or vf.Error(
+                    type="EpisodeFailed", message="A sibling trace in this episode failed"
+                )
+                trace.errors = [*trace.errors, error]
+                trace.ok = False
+        return episode
 
 
 class TrainEnv(Env):
-    config: TrainEnvConfig
+    config: TrainSourceConfig
 
-    def __init__(self, config: TrainEnvConfig):
-        super().__init__(config)
-        self.sampling_args = config.sampling.to_sampling_args()
-
-    def get_dataset(self, seed: int | None = None):
-        return self.env.get_dataset(seed=seed)
+    def __init__(
+        self,
+        config: TrainSourceConfig,
+        address: str | None,
+        address_file: Path,
+        generation_source: GenerationSource,
+        algorithm: Algorithm,
+    ):
+        super().__init__(config, address, address_file)
+        self.generation_source = generation_source
+        self.algorithm = algorithm
+        self.sampling_args = generation_source.sampling_args(config.sampling.to_sampling_args())
+        # Truncated policy sampling must ship the sampling masks the trainer replays.
+        self.requires_sampling_masks = (
+            config.sampling.truncates_distribution() and config.algo.sampling.source == "policy"
+        )
 
 
 class EvalEnv(Env):
-    config: EvalEnvConfig
+    config: EvalSourceConfig
 
-    def __init__(self, config: EvalEnvConfig):
-        super().__init__(config)
+    def __init__(self, config: EvalSourceConfig, address: str | None, address_file: Path):
+        super().__init__(config, address, address_file)
         self.sampling_args = config.sampling.to_sampling_args()
-        self.examples = self.env.get_eval_dataset(n=config.num_examples).to_list()
+        self.examples: list[vf.Task] = []
 
-    async def evaluate(
-        self,
-        model_name: str,
-        get_client: Callable[[], Awaitable[vf.ClientConfig]],
-        step: int,
-        cache_salt: str,
-    ) -> list[vf.RolloutOutput]:
-        num_examples = len(self.examples)
-        group_size = self.config.group_size
-        get_logger().info(f"Evaluating {self.name} ({num_examples=}, {group_size=})")
-        total_rollouts = num_examples * group_size
-        pbar = ProgressTracker(total=total_rollouts, desc=f"Evaluating {self.name}")
-        eval_start = time.perf_counter()
-
-        if self.requires_group_scoring:
-
-            async def run_with_progress(example: dict) -> list[vf.RolloutOutput] | None:
-                """Run group_size rollouts as a scored group for one example."""
-                try:
-                    client = await get_client()
-                    outputs = await self.run_group(
-                        client=client,
-                        example=example,
-                        model_name=model_name,
-                        group_size=group_size,
-                        cache_salt=cache_salt,
-                    )
-                    pbar.update(group_size)
-                    return outputs
-                except Exception as e:
-                    get_logger().warning(f"Group failed: {e}")
-                    pbar.update(group_size)
-                    return None
-
-            coros = [run_with_progress(example) for example in self.examples]
-
-        else:
-
-            async def run_with_progress(example: dict) -> list[vf.RolloutOutput] | None:
-                """Run a single rollout for one example."""
-                try:
-                    client = await get_client()
-                    output = await self.run_rollout(
-                        client=client, example=example, model_name=model_name, cache_salt=cache_salt
-                    )
-                    pbar.update(1)
-                    return [output]
-                except Exception as e:
-                    get_logger().warning(f"Rollout failed: {e}")
-                    pbar.update(1)
-                    return None
-
-            coros = [run_with_progress(example) for example in self.examples for _ in range(group_size)]
-
-        try:
-            results = await asyncio.gather(*coros)
-        finally:
-            pbar.close()
-
-        successful_outputs = [o for group in results if group is not None for o in group]
-        failed_count = total_rollouts - len(successful_outputs)
-        eval_time = time.perf_counter() - eval_start
-
-        if failed_count:
-            get_logger().warning(
-                f"{failed_count}/{total_rollouts} ({failed_count / total_rollouts * 100:.1f}%) rollouts failed"
-            )
-
-        if not successful_outputs:
-            get_logger().warning(f"All rollouts failed for {self.name}, skipping logging metrics")
-            get_monitor().log(
-                {
-                    f"eval/{self.name}/failed_rollouts": failed_count / total_rollouts,
-                    "step": step,
-                },
-                step=step,
-            )
-            return []
-
-        # Log metrics
-        monitor = get_monitor()
-
-        rows = [
-            {
-                "example_id": o["example_id"],
-                "reward": o["reward"],
-                "completion_len": get_completion_len(o),
-                "is_truncated": o["is_truncated"],
-                "has_error": o.get("error") is not None,
-                "no_response": not o.get("completion"),
-            }
-            for o in successful_outputs
-        ]
-        results_df = pd.DataFrame(rows)
-
-        unique_rewards = results_df.reward.dropna().unique()
-        could_be_binary = set(unique_rewards).issubset({0.0, 1.0})
-        if could_be_binary:
-            pass_at_k = (
-                results_df.groupby("example_id")
-                .apply(lambda x: compute_pass_at_k(x.reward.dropna()), include_groups=False)
-                .apply(pd.Series)
-            )
-        else:
-            pass_at_k = None
-            get_logger().warning("Skipping computing pass@k rates because the task rewards appear to be non-binary")
-
-        message = f"Evaluated {self.name} in {eval_time:.2f}s (Avg@{group_size}={results_df.reward.mean():.4f}"
-        if could_be_binary:
-            assert pass_at_k is not None
-            for pass_rate, pass_rate_score in pd.Series(pass_at_k.mean()).items():
-                message += f", {capitalize(str(pass_rate))}: {pass_rate_score:.4f}"
-
-        message += (
-            f", No-response: {results_df.no_response.mean() * 100:.1f}%"
-            f", Completion Length: {results_df.completion_len.mean():.2f} (±{results_df.completion_len.std():.2f}, ∈[{results_df.completion_len.min():.2f}, {results_df.completion_len.max():.2f}])"
-            f", Truncated: {results_df.is_truncated.mean() * 100:.1f}%)"
-        )
-        get_logger().success(message)
-
-        eval_metrics = {
-            f"avg@{group_size}": float(results_df.reward.mean()),
-            "no_response/mean": float(results_df.no_response.mean()),
-            "no_response/count": int(results_df.no_response.sum()),
-            "completion_len/mean": results_df.completion_len.mean().item(),
-            "completion_len/max": results_df.completion_len.max().item(),
-            "completion_len/min": results_df.completion_len.min().item(),
-            "is_truncated/mean": results_df.is_truncated.mean().item(),
-            "failed_rollouts": failed_count / total_rollouts,
-            "time": eval_time,
-        }
-        if could_be_binary:
-            assert pass_at_k is not None
-            eval_metrics.update(pd.Series(pass_at_k.mean()).to_dict())
-        eval_metrics = {f"eval/{self.name}/{key}": v for key, v in eval_metrics.items()}
-        eval_metrics["step"] = step
-        monitor.log(eval_metrics, step=step)
-        monitor.log_eval_samples(successful_outputs, env_name=self.name, step=step)
-
-        return successful_outputs
+    async def start(self) -> None:
+        await super().start()
+        if self.num_tasks is None:
+            raise ValueError(f"Eval env {self.name} has an infinite taskset — set select.limit to bound it")
+        # A fixed eval set, pulled off the tasks once and reused every epoch.
+        self.examples = list(self.tasks)
 
 
 EnvT = TypeVar("EnvT", bound=Env)
@@ -349,55 +204,54 @@ class Envs(Generic[EnvT]):
     def __len__(self) -> int:
         return len(self._envs)
 
-    async def start(
-        self,
-        log_dir: Path,
-        log_level: str | None = None,
-        json_logging: bool = False,
-    ) -> None:
-        """Spawn env servers (where needed) and connect env clients one at a time.
+    async def start(self) -> None:
+        """Connect to all env servers in parallel — every address is known up front,
+        so there's nothing to serialize on."""
+        # When several env.start()s load_dataset() concurrently, datasets' parallel arrow read
+        # (tqdm thread_map) races in ensure_lock's `del tqdm_class._lock` and crashes with
+        # `AttributeError: type object 'tqdm' has no attribute '_lock'`. Pre-seed the lock so it
+        # isn't created-and-deleted per call.
+        from datasets.utils import tqdm as hf_tqdm
 
-        Serialized to avoid a TOCTOU port race: get_free_port() only holds the port
-        until it returns, so parallel spawns can hand the same port to two children.
-        """
-        for env in self:
-            await env.start(log_dir=log_dir, log_level=log_level, json_logging=json_logging)
-        atexit.register(self.shutdown)
-
-    def shutdown(self) -> None:
-        """Terminate all spawned env server processes in parallel."""
-        processes = [env._env_server_process for env in self if env._env_server_process is not None]
-        if not processes:
-            return
-        logger = get_logger()
-        logger.info(f"Shutting down {len(processes)} env server(s), waiting for sandbox cleanup...")
-        for p in processes:
-            p.terminate()
-        for p in processes:
-            p.join(timeout=25)
-            if p.is_alive():
-                logger.warning(f"Env server {p.pid} did not exit after 25s, force killing")
-                p.kill()
-                p.join(timeout=5)
-        for env in self:
-            env._env_server_process = None
+        hf_tqdm.set_lock(hf_tqdm.get_lock())
+        await asyncio.gather(*(env.start() for env in self))
 
 
 class TrainEnvs(Envs[TrainEnv]):
-    """Collection of training environments."""
+    """Collection of training environments, each paired with its
+    :class:`GenerationSource` and runtime :class:`Algorithm`, built from the env's
+    resolved algorithm config."""
 
-    def __init__(self, configs: Sequence[TrainEnvConfig]):
+    def __init__(
+        self,
+        configs: Sequence[TrainSourceConfig],
+        addresses: dict[tuple[str, str], str | None],
+        config_dir: Path,
+        *,
+        clients,
+        renderer_config=None,
+    ):
         self._envs: dict[str, TrainEnv] = {}
         for config in configs:
-            env = TrainEnv(config)
+            get_logger().info(f"Initializing {config.algo.type} algorithm for {config.resolved_name}")
+            env = TrainEnv(
+                config,
+                addresses[("train", config.resolved_name)],
+                env_address_file(config_dir, "train", config.resolved_name),
+                GenerationSource(config.algo.sampling, clients, renderer_config),
+                build_algorithm(config.algo, clients),
+            )
             self._envs[env.name] = env
 
 
 class EvalEnvs(Envs[EvalEnv]):
     """Collection of evaluation environments."""
 
-    def __init__(self, configs: Sequence[EvalEnvConfig]):
+    def __init__(
+        self, configs: Sequence[EvalSourceConfig], addresses: dict[tuple[str, str], str | None], config_dir: Path
+    ):
         self._envs: dict[str, EvalEnv] = {}
         for config in configs:
-            env = EvalEnv(config)
+            name = config.resolved_name
+            env = EvalEnv(config, addresses[("eval", name)], env_address_file(config_dir, "eval", name))
             self._envs[env.name] = env

@@ -2,6 +2,7 @@ import json as json_module
 import logging
 import sys
 import traceback
+from pathlib import Path
 from typing import Any
 
 # Global logger instance
@@ -92,13 +93,22 @@ class InterceptHandler(logging.Handler):
         if self.prefix is not None:
             message = f"[{self.prefix}] {message}"
         logger.opt(depth=depth, exception=record.exc_info).log(level, message)
+        # A failed worker exits immediately, so drain its queued JSON traceback first.
+        if _JSON_LOGGING and record.exc_info:
+            logger.complete()
 
 
 def setup_logger(
     log_level: str = "info",
     tag: str | None = None,
     json_logging: bool = False,
+    log_file: Path | None = None,
+    console_level: str | None = None,
 ):
+    """Install the prime-rl logger: a console sink (colorized, or JSON lines with
+    ``json_logging``) and, with ``log_file``, a plain-text file sink for processes that
+    no launcher redirects. ``console_level`` raises the console sink's threshold above
+    ``log_level`` (the file keeps everything), e.g. to surface only errors while a run is in flight."""
     global _LOGGER, _JSON_LOGGING
     _JSON_LOGGING = json_logging
 
@@ -151,9 +161,17 @@ def setup_logger(
 
     # Install console handler (enqueue=True only for JSON mode to avoid blocking in async contexts)
     if json_logging:
-        logger.add(json_sink, level=log_level.upper(), enqueue=True)
+        logger.add(json_sink, level=(console_level or log_level).upper(), enqueue=True)
     else:
-        logger.add(sys.stdout, format=format, level=log_level.upper(), colorize=True)
+        logger.add(sys.stdout, format=format, level=(console_level or log_level).upper(), colorize=True)
+    if log_file is not None:
+        # The console format carries raw ANSI codes; the file gets a plain layout.
+        logger.add(
+            log_file,
+            format="{time:HH:mm:ss} {level: >7} " + f"{tag_prefix}{{message}}",
+            level=log_level.upper(),
+            colorize=False,
+        )
 
     # Disable critical logging
     logger.critical = lambda _: None
@@ -245,3 +263,28 @@ class ProgressTracker:
             percent = int(100 * self.current / self.total)
             if percent > self._last_logged_percent:
                 self._emit_progress(percent)
+
+
+def format_time(seconds: float) -> str:
+    """
+    Format a time in seconds to a human-readable format:
+    - >1d -> Xd Yh
+    - >1h -> Xh Ym
+    - >1m -> Xm Ys
+    - <1s -> Xms
+    - Else: Xs
+    """
+    if seconds < 1:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    if seconds < 3600:
+        m, s = divmod(seconds, 60)
+        return f"{int(m)}m {int(s)}s"
+    if seconds < 86400:
+        h, rem = divmod(seconds, 3600)
+        m = rem // 60
+        return f"{int(h)}h {int(m)}m"
+    d, rem = divmod(seconds, 86400)
+    h = rem // 3600
+    return f"{int(d)}d {int(h)}h"

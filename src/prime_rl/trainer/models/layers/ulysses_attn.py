@@ -15,12 +15,20 @@ Ulysses is the simpler alternative to ring attention for context parallelism:
     [S/cp, H,    D]  ◀── all-to-all ──   [S, H/cp, D]
                          (seq ↔ heads)
 
-Key benefit: the attention kernel itself does not need to be CP-aware. The
-all-to-all is purely on Q/K/V tensors, so this works out of the box with
-softmax flash-attn, linear attention, mamba, etc., without rewriting kernels.
+The softmax-attention kernel itself does not need to be CP-aware. Hybrid models
+use the same sequence/head redistribution in their owned recurrent modules.
+
+GQA models with fewer KV heads than cp_size (e.g. NemotronH: 32 query heads, 2
+KV heads) are handled by replicating each KV head cp_size / num_key_value_heads
+times before the seq->head all-to-all. Query heads are grouped contiguously in
+GQA, so the replicated layout lands every rank on exactly the KV head its local
+query-head slice attends to; the backward of the replication sums gradients
+over replicas, which is the exact GQA KV gradient.
 
 Constraints:
-- cp_size must divide both num_attention_heads and num_key_value_heads.
+- cp_size must divide num_attention_heads.
+- cp_size must divide num_key_value_heads, OR num_key_value_heads must divide
+  cp_size (the KV-replication path).
 - Sequence length must be divisible by cp_size.
 """
 
@@ -28,7 +36,8 @@ from __future__ import annotations
 
 import torch
 import torch.distributed as dist
-import torch.distributed.nn.functional as dist_nn
+
+from prime_rl.trainer.distributed.collectives import all_to_all_single_equal
 
 # Populated by `update_ulysses_params` before each forward pass. Mirrors
 # ring_flash_attn's DATA_PARAMS pattern so the patched attention path can
@@ -41,6 +50,24 @@ def update_ulysses_params(cu_seqlens: torch.Tensor, max_seqlen: int) -> None:
     ULYSSES_PARAMS["max_seqlen"] = int(max_seqlen)
 
 
+def _replicate_kv_heads(t: torch.Tensor, cp_size: int) -> torch.Tensor:
+    """Replicate KV heads so a GQA tensor with fewer heads than cp_size can be
+    head-sharded: [S_local, H_kv, D] -> [S_local, cp_size, D].
+
+    Each KV head is repeated cp_size / H_kv times. GQA groups query heads
+    contiguously (query head j attends KV head j // (H_q / H_kv)), so after the
+    seq->head all-to-all rank r holds query heads [r * H_q/cp, (r+1) * H_q/cp)
+    — all attending KV head floor(r * H_kv / cp) — and replica index r maps to
+    the same head: floor(r / (cp / H_kv)). The backward sums gradients over
+    replicas, which is exactly the GQA KV gradient.
+    """
+    s_local, h, d = t.shape
+    assert cp_size % h == 0, (
+        f"num_key_value_heads ({h}) must divide cp_size ({cp_size}) for the ulysses KV-replication path"
+    )
+    return t.repeat_interleave(cp_size // h, dim=1)
+
+
 def _all_to_all_seq_to_head(t: torch.Tensor, cp_size: int, cp_group: dist.ProcessGroup) -> torch.Tensor:
     """Redistribute [S_local, H, D] -> [S_global, H_local, D].
 
@@ -48,13 +75,15 @@ def _all_to_all_seq_to_head(t: torch.Tensor, cp_size: int, cp_group: dist.Proces
     ends up with the full sequence but only H/cp_size heads. Differentiable.
     """
     s_local, h, d = t.shape
-    assert h % cp_size == 0, f"num_heads ({h}) must be divisible by cp_size ({cp_size})"
+    assert h % cp_size == 0, (
+        f"num_heads ({h}) must be divisible by cp_size ({cp_size}); "
+        "for GQA KV tensors with fewer heads than cp_size, replicate first via _replicate_kv_heads"
+    )
     h_local = h // cp_size
 
     # [S_local, cp_size, H_local, D] -> [cp_size, S_local, H_local, D]
     t = t.reshape(s_local, cp_size, h_local, d).transpose(0, 1).contiguous()
-    output = torch.empty_like(t)
-    out = dist_nn.all_to_all_single(output, t, group=cp_group)
+    out = all_to_all_single_equal(t, cp_group)
     # out[i] is the chunk that source-rank i had at position my_rank, i.e.
     # source-rank i's local sequence shard for *my* head slice.
     return out.reshape(cp_size * s_local, h_local, d)
@@ -68,8 +97,7 @@ def _all_to_all_head_to_seq(t: torch.Tensor, cp_size: int, cp_group: dist.Proces
     h = h_local * cp_size
 
     t = t.reshape(cp_size, s_local, h_local, d).contiguous()
-    output = torch.empty_like(t)
-    out = dist_nn.all_to_all_single(output, t, group=cp_group)
+    out = all_to_all_single_equal(t, cp_group)
     # out[s']: original chunk for sequence-rank s' (which now becomes head-rank s').
     return out.transpose(0, 1).contiguous().reshape(s_local, h, d)
 
@@ -91,13 +119,21 @@ def ulysses_flash_attn_varlen_func(
     softmax_scale: float | None = None,
     dropout_p: float = 0.0,
     deterministic: bool | None = None,
+    learnable_sink: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run varlen flash attention under Ulysses CP.
 
     `cu_seqlens_*` and `max_seqlen_*` describe the *full* (un-sharded) sequence,
     because after the seq->head all-to-all each rank holds the full sequence.
+
+    GQA with num_key_value_heads < cp_size: K/V heads are replicated up to
+    cp_size before the all-to-all (see `_replicate_kv_heads`), so each rank runs
+    grouped attention on its query-head slice with the single matching KV head.
     """
     q = _all_to_all_seq_to_head(q, cp_size, cp_group)
+    if k.shape[1] < cp_size:
+        k = _replicate_kv_heads(k, cp_size)
+        v = _replicate_kv_heads(v, cp_size)
     k = _all_to_all_seq_to_head(k, cp_size, cp_group)
     v = _all_to_all_seq_to_head(v, cp_size, cp_group)
 
@@ -110,17 +146,20 @@ def ulysses_flash_attn_varlen_func(
         kwargs["dropout_p"] = dropout_p
     if deterministic is not None:
         kwargs["deterministic"] = deterministic
+    if learnable_sink is not None:
+        local_heads = q.shape[1]
+        rank = dist.get_rank(cp_group)
+        kwargs["learnable_sink"] = learnable_sink[rank * local_heads : (rank + 1) * local_heads]
 
     if flash_attn_version == 4:
         # FA4 takes cu_seqlens as keyword args (qv positional collides otherwise).
         kwargs["cu_seqlens_q"] = cu_seqlens_q
         kwargs["cu_seqlens_k"] = cu_seqlens_k
-        out = flash_fn(q, k, v, **kwargs)
+        kwargs["max_seqlen_q"] = max_seqlen_q
+        kwargs["max_seqlen_k"] = max_seqlen_k
+        out, _ = flash_fn(q, k, v, **kwargs)
     else:
         out = flash_fn(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs)
-    if isinstance(out, tuple):
-        out = out[0]
-
     return _all_to_all_head_to_seq(out, cp_size, cp_group)
 
 
@@ -136,11 +175,10 @@ def substitute_ulysses_attn(
     cp_size = dist.get_world_size(group=process_group)
 
     # Resolve flash kernel + version from attn_impl.
-    if attn_impl == "fa4":
+    if attn_impl == "flash_attention_4":
         from flash_attn.cute import flash_attn_varlen_func as flash_fn
 
         flash_attn_version = 4
-        flash_fn = torch._dynamo.disable(flash_fn)
     elif attn_impl == "flash_attention_3":
         from flash_attn_interface import flash_attn_varlen_func as flash_fn
 
@@ -185,9 +223,9 @@ def substitute_ulysses_attn(
 
     AfmoeFlashAttention._compute_attention = _ulysses_compute_attention
 
-    from prime_rl.trainer.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeGatedFlashAttention
+    from prime_rl.trainer.models.gpt_oss.attention import substitute_gpt_oss_ulysses_attention
 
-    Qwen3_5MoeGatedFlashAttention._compute_attention = _ulysses_compute_attention
+    substitute_gpt_oss_ulysses_attention(process_group)
 
 
 def substitute_hf_ulysses_attn(process_group: dist.ProcessGroup) -> None:

@@ -10,6 +10,19 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_BIN="$PROJECT_DIR/.venv/bin"
 PYTHON="$VENV_BIN/python"
 
+# UCX's --with-verbs silently disables IB/RoCE support when the rdma-core *dev*
+# headers (verbs.h / rdma_cma.h) are missing, yielding a TCP-only build. On hosts
+# with RDMA devices, require the headers up front instead of failing at runtime.
+HAVE_RDMA=0
+if compgen -G "/sys/class/infiniband/*" > /dev/null; then
+    HAVE_RDMA=1
+    if [ ! -f /usr/include/infiniband/verbs.h ] || [ ! -f /usr/include/rdma/rdma_cma.h ]; then
+        echo "ERROR: host has RDMA devices but the rdma-core dev headers are missing." >&2
+        echo "Install them first, e.g.: apt-get install -y libibverbs-dev librdmacm-dev" >&2
+        exit 1
+    fi
+fi
+
 WORKSPACE="$PROJECT_DIR/nixl_workspace"
 mkdir -p "$WORKSPACE"
 UCX_SRC="$WORKSPACE/ucx_source"
@@ -40,11 +53,23 @@ if [ ! -f "$UCX_INSTALL/lib/libucs.so" ]; then
         --enable-devel-headers \
         --enable-mt \
         --with-verbs \
+        --with-rdmacm \
         --with-cuda="$CUDA_PATH" \
         --with-ze=no
     make -j"$NPROC"
     make install
     echo "=== UCX installed to $UCX_INSTALL ==="
+
+    # Fail loudly if the IB transports didn't make it into the build.
+    if [ "$HAVE_RDMA" = 1 ]; then
+        ucx_transports=$(LD_LIBRARY_PATH="$UCX_INSTALL/lib:$UCX_INSTALL/lib/ucx:${LD_LIBRARY_PATH:-}" \
+            "$UCX_INSTALL/bin/ucx_info" -d)
+        if ! grep -q "Transport: rc_verbs" <<< "$ucx_transports"; then
+            echo "ERROR: UCX built without IB (rc_verbs) transport despite RDMA devices being present." >&2
+            echo "Check that libibverbs-dev / librdmacm-dev were present at configure time." >&2
+            exit 1
+        fi
+    fi
 else
     echo "=== UCX already built, skipping ==="
 fi
@@ -57,6 +82,10 @@ else
 fi
 cd "$NIXL_SRC"
 git checkout "$NIXL_VERSION"
+# Name the wheel nixl-cu13 (pyproject says nixl-cu12): the `nixl` shim imports
+# nixl_cu13 first, so a nixl_cu12 build would sit unused next to the PyPI wheel.
+git checkout -- pyproject.toml
+uv run --no-project --with tomlkit python contrib/tomlutil.py --wheel-name nixl-cu13 pyproject.toml
 
 export PKG_CONFIG_PATH="$UCX_INSTALL/lib/pkgconfig"
 export LD_LIBRARY_PATH="$UCX_INSTALL/lib:$UCX_INSTALL/lib/ucx:${LD_LIBRARY_PATH:-}"
@@ -65,7 +94,13 @@ export LD_LIBRARY_PATH="$UCX_INSTALL/lib:$UCX_INSTALL/lib/ucx:${LD_LIBRARY_PATH:
 WHEEL_DIR="$PROJECT_DIR/deps"
 mkdir -p "$WHEEL_DIR"
 uv pip install pip 2>/dev/null
-"$PYTHON" -m pip wheel . --no-deps --wheel-dir="$WHEEL_DIR"
+# NIXL's [build-system] requires are unpinned; meson-python 0.22.0 stopped
+# keeping Meson's build RPATH in wheel libraries, which drops the link to the
+# UCX built above. Constrain the backend to the version these wheels were
+# validated with (same pin as Dockerfile.cuda).
+printf 'meson-python==0.21.1\n' > "$WORKSPACE/nixl-build-constraints.txt"
+"$PYTHON" -m pip wheel . --no-deps --wheel-dir="$WHEEL_DIR" \
+    --build-constraint "$WORKSPACE/nixl-build-constraints.txt"
 
-WHEEL=$(ls "$WHEEL_DIR"/nixl*.whl | head -1)
+WHEEL=$(ls "$WHEEL_DIR"/nixl_cu13-"$NIXL_VERSION"-*.whl | head -1)
 echo "=== NIXL wheel built at: $WHEEL ==="

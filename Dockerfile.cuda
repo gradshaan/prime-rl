@@ -1,7 +1,21 @@
+# syntax=docker/dockerfile:1
+# ^ `COPY --exclude` (used to split the venv into parallel-compressible layers) needs
+# Dockerfile syntax >= 1.19; `docker/dockerfile:1` resolves to the latest stable 1.x.
+
 #inspired from https://github.com/astral-sh/uv-docker-example/blob/main/multistage.Dockerfile
 
+# Every pyproject.toml + uv.lock, so the dependency sync below caches
+# independently of source edits.
+FROM nvidia/cuda:13.0.1-base-ubuntu24.04 AS manifests
+# .git is ~735 MB, changes every commit, and would land in the registry cache.
+COPY --exclude=.git . /ctx
+RUN mkdir -p /manifests \
+    && cd /ctx \
+    && find . -name .git -prune -o -type f -name pyproject.toml -exec cp --parents {} /manifests/ \; \
+    && cp uv.lock /manifests/
+
 # Build stage - multi-arch base (supports amd64 + arm64)
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04 AS builder
+FROM nvidia/cuda:13.0.1-cudnn-devel-ubuntu24.04 AS builder
 LABEL maintainer="prime intellect"
 LABEL repository="prime-rl"
 
@@ -32,6 +46,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends --force-yes \
     libnl-route-3-dev \
     libibverbs-dev \
     librdmacm-dev \
+    python3.12 \
+    python3.12-venv \
+    python3.12-dev \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
     && apt-get clean autoclean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 ARG UCX_VERSION=1.19.1
@@ -60,13 +78,31 @@ ADD https://astral.sh/uv/install.sh /uv-installer.sh
 # Set install dir to location accessible to non-root users
 RUN INSTALLER_NO_MODIFY_PATH=1 UV_INSTALL_DIR="/usr/local/bin" sh /uv-installer.sh && rm /uv-installer.sh
 ENV PATH="/usr/local/bin:$PATH"
-ENV UV_PYTHON_INSTALL_DIR="/usr/local/share/uv/python"
+# Build .venv against the system CPython, so the venv's recorded interpreter
+# matches the runtime interpreter and no bin/python relink is needed at runtime.
+ENV UV_PYTHON_PREFERENCE=only-system
 ENV UV_CACHE_DIR="/usr/local/share/uv/cache"
+# Explicity set venv dir inside /app so to ensure it gets copied over during
+# the runtime stage's `COPY /app`
+ENV UV_PROJECT_ENVIRONMENT="/app/.venv"
 
-# Install Python dependencies (The gradual copies help with caching)
+# Install Python dependencies
 WORKDIR /app
 
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
+
+# Third-party deps only — source edits don't bust this layer. First-party
+# editables install in the source-layer sync below. No build-context bind
+# mount here: .git would bust the cache every commit.
+# `--extra dashboard` (fastapi/uvicorn) is baked in so the fft chart's dashboard pod needs no runtime uv sync (see PR body).
+COPY --from=manifests /manifests /app
+RUN --mount=type=cache,target=/usr/local/share/uv/cache \
+    uv sync --all-packages --extra gpu --extra dashboard --extra flash-attn --extra flash-attn-3 --extra flash-attn-cute --extra disagg --extra quack --extra kernels --group mamba-ssm --locked --no-dev \
+        --no-install-workspace \
+        --no-install-package prime-rl-configs \
+        --no-install-package verifiers \
+        --no-install-package renderers \
+        --no-install-package prime-pydantic-config
 
 COPY pyproject.toml /app/pyproject.toml
 COPY uv.lock /app/uv.lock
@@ -76,27 +112,96 @@ COPY packages/ /app/packages/
 COPY deps/ /app/deps/
 COPY configs /app/configs
 COPY examples /app/examples
+COPY k8s /app/k8s
 COPY benchmarks/scripts /app/benchmarks/scripts
+COPY scripts/docker-editable-pretend-versions.sh /app/scripts/docker-editable-pretend-versions.sh
 
-RUN --mount=type=cache,target=/app/.cache/uv \
-    uv sync --extra flash-attn --extra flash-attn-3 --extra flash-attn-cute --extra envs --extra gpt-oss --extra modelexpress --group mamba-ssm --locked --no-dev
+# Use submodule git metadata from the build context when present. Docker copies
+# only the submodule .git pointer files into /app/deps, so we temporarily link
+# /app/.git/modules to the read-only context before resolving versions.
+ARG VERIFIERS_PRETEND_VERSION
+ARG RENDERERS_PRETEND_VERSION
+RUN --mount=type=cache,target=/usr/local/share/uv/cache \
+    --mount=type=bind,source=.,target=/build-context,readonly \
+    if [ -d /build-context/.git/modules ]; then mkdir -p /app/.git && ln -s /build-context/.git/modules /app/.git/modules; fi \
+    && \
+    eval "$(bash /app/scripts/docker-editable-pretend-versions.sh --shell /app)" \
+    && \
+    if [ -L /app/.git/modules ]; then rm /app/.git/modules && rmdir /app/.git 2>/dev/null || true; fi \
+    && \
+    sed -i "s/fallback-version = \"0.0.0\"/fallback-version = \"${VERIFIERS_PRETEND_VERSION}\"/" /app/deps/verifiers/pyproject.toml \
+    && \
+    sed -i "s/fallback-version = \"0.0.0\"/fallback-version = \"${RENDERERS_PRETEND_VERSION}\"/" /app/deps/renderers/pyproject.toml \
+    && \
+    uv sync --all-packages --extra gpu --extra dashboard --extra flash-attn --extra flash-attn-3 --extra flash-attn-cute --extra disagg --extra quack --extra kernels --group mamba-ssm --locked --no-dev \
+    && \
+    /app/.venv/bin/python -c 'from importlib.metadata import version; [version(name) for name in ("deep-ep", "deep-gemm", "mamba-ssm", "nixl", "prime-kernels", "quack-kernels", "vllm", "vllm-router")]'
 
-# arm64: build flash-attn from source, fix namespace conflicts, apply workarounds
-ARG TARGETARCH
-COPY scripts/docker-arm64-post-install.sh /app/scripts/docker-arm64-post-install.sh
-RUN if [ "$TARGETARCH" = "arm64" ]; then /app/scripts/docker-arm64-post-install.sh; fi
+# Build NIXL from source against the UCX 1.19 baked above. The PyPI nixl wheel
+# ships its own UCX which segfaults on prefill→decode KV transfer (#2883);
+# rebuilding against our UCX is the documented fix. The rename is required: an
+# unrenamed source build is `nixl_cu12`, and the `nixl` shim imports nixl_cu13
+# (the PyPI wheel) first, so the fix would silently not apply. Libraries carry
+# RUNPATH=/opt/ucx/lib, so no LD_LIBRARY_PATH is needed at runtime.
+# Opt out via `--build-arg INCLUDE_NIXL_FROM_SOURCE=0`.
+#
+# NIXL's [build-system] requires are unpinned, so pip's build isolation picks up
+# new backends as they are released. meson-python 0.22.0 stopped keeping Meson's
+# build RPATH in wheel libraries, which dropped RUNPATH=/opt/ucx/lib and failed
+# the linkage check below on every build. Pin the validated backend.
+ARG INCLUDE_NIXL_FROM_SOURCE=1
+ARG NIXL_VERSION=0.10.1
+RUN if [ "$INCLUDE_NIXL_FROM_SOURCE" = "1" ]; then \
+        VIRTUAL_ENV=/app/.venv uv pip install pip \
+        && git clone --depth 1 --branch ${NIXL_VERSION} https://github.com/ai-dynamo/nixl.git /tmp/nixl \
+        && cd /tmp/nixl \
+        && uv run --no-project --with tomlkit python contrib/tomlutil.py --wheel-name nixl-cu13 pyproject.toml \
+        && printf 'meson-python==0.21.1\n' > /tmp/nixl-build-constraints.txt \
+        && PKG_CONFIG_PATH=/opt/ucx/lib/pkgconfig \
+           /app/.venv/bin/python -m pip wheel . --no-deps --wheel-dir=/tmp/nixl-whl \
+               --build-constraint /tmp/nixl-build-constraints.txt \
+        && VIRTUAL_ENV=/app/.venv uv pip install --reinstall --no-deps /tmp/nixl-whl/nixl_cu13-*.whl \
+        && PLUGIN=/app/.venv/lib/python3.12/site-packages/.nixl_cu13.mesonpy.libs/plugins/libplugin_UCX.so \
+        && if ! ldd "$PLUGIN" | grep -q /opt/ucx/lib/libucp.so; then \
+               echo "ERROR: $PLUGIN does not link /opt/ucx/lib. RUNPATH and ldd output:" >&2; \
+               readelf -d "$PLUGIN" | grep -E 'RUNPATH|RPATH' >&2 || true; \
+               ldd "$PLUGIN" >&2; \
+               exit 1; \
+           fi \
+        && rm -rf /tmp/nixl /tmp/nixl-whl /tmp/nixl-build-constraints.txt; \
+    fi
 
-FROM python:3.12-slim
+# Trim the CUDA toolkit to the nvcc-JIT essentials in a separate stage, so the runtime
+# COPY ships only the trimmed result (~1.5 GB) instead of the full ~6.6 GB. Drops the math
+# runtime libs (cublas/cusparse/cufft/cusolver/curand/npp/nvjpeg) and big static .a
+# archives since nvcc JIT (TileLang/FlashInfer build their own kernels) and torch
+# (uses pinned nvidia-* wheels) needs them. Keeps nvcc/nvvm/ptxas + headers +
+# libcudart/libnvrtc/libcudadevrt for JIT compile+link.
+FROM builder AS cuda-trim
+RUN find /usr/local/cuda-13.0/targets/*/lib \
+        \( -name 'libcublas*' -o -name 'libcusparse*' -o -name 'libcufft*' \
+           -o -name 'libcusolver*' -o -name 'libcurand*' -o -name 'libnpp*' \
+           -o -name 'libnvjpeg*' -o -name 'libnvblas*' \) -delete \
+    && find /usr/local/cuda-13.0 -name '*.a' ! -name 'libcudadevrt.a' ! -name 'libcudart_static.a' -delete
+
+# Runtime image
+FROM nvidia/cuda:13.0.1-base-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y \
     --no-install-recommends \
     --force-yes \
+    python3.12 \
+    python3.12-venv \
+    python3.12-dev \
     build-essential \
     wget \
     clang \
     tmux \
     iperf \
     openssh-server \
+    git \
     git-lfs \
     gpg \
     sudo \
@@ -110,13 +215,49 @@ RUN apt-get update && apt-get install -y \
     libibverbs1 \
     ibverbs-providers \
     librdmacm1 \
+    libhwloc15 \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
     && apt-get clean autoclean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
+# AWS EFA userspace stack: libfabric + the aws-ofi-nccl NCCL net plugin,
+# installed as one version-matched unit via AWS's official installer rather
+# than picking versions by hand. Do not substitute a host-mounted copy of
+# these libraries instead of building them in -- symbol-version mismatches
+# between a host's rdma-core and a container's can silently break the NCCL
+# plugin. Run directly in this stage (not a separate one COPY'd in after):
+# the installer's own apt-get/dpkg step upgrades system rdma-core packages
+# (libibverbs, ibverbs-providers, librdmacm) in place to versions libfabric
+# actually links against -- copying only /opt/amazon out of an isolated
+# stage leaves that system-wide upgrade behind, so libfabric ends up paired
+# with whatever older rdma-core this image's own apt install pulled in and
+# fails to load (symbol version mismatch on libefa.so.1). --skip-kmod:
+# containers share the host kernel and must never build/load a kernel
+# module themselves; the EFA driver is expected to already be present on
+# the host. --skip-limit-conf: ulimits config doesn't apply inside a build.
+ARG EFA_INSTALLER_VERSION=1.47.0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates tar gzip \
+    && curl -fsSL "https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz" \
+        -o /tmp/aws-efa-installer.tar.gz \
+    && tar -xzf /tmp/aws-efa-installer.tar.gz -C /tmp \
+    && cd /tmp/aws-efa-installer \
+    && ./efa_installer.sh -y --skip-kmod --skip-limit-conf \
+    && cd / && rm -rf /tmp/aws-efa-installer.tar.gz /tmp/aws-efa-installer \
+    && apt-get clean autoclean && rm -rf /var/lib/apt/lists/*
+
+# CUDA 13.0 toolkit (TileLang's runtime nvcc JIT)
+COPY --from=cuda-trim /usr/local/cuda-13.0 /usr/local/cuda-13.0
+RUN ln -sfn /usr/local/cuda-13.0 /usr/local/cuda && test -x /usr/local/cuda/bin/nvcc
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH="/usr/local/cuda/bin:${PATH}"
 
 ARG USER_ID=1000
 ARG GROUP_ID=1000
-RUN groupadd --gid $GROUP_ID appuser && \
+
+RUN userdel -r ubuntu 2>/dev/null || true; \
+    groupdel ubuntu 2>/dev/null || true; \
+    groupadd --gid $GROUP_ID appuser && \
     useradd --uid $USER_ID --gid appuser --create-home --shell /bin/bash appuser && \
     usermod -aG sudo appuser && \
     echo "appuser ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
@@ -128,17 +269,31 @@ RUN INSTALLER_NO_MODIFY_PATH=1 UV_INSTALL_DIR="/usr/local/bin" sh /uv-installer.
 USER appuser
 ENV PATH="/usr/local/bin:$PATH"
 WORKDIR /app
-# Copy the application from the builder
-COPY --from=builder --chown=appuser:appuser /app /app
+# Copy the application from the builder, splitting the venv's largest trees into their
+# own layers. BuildKit compresses and pushes layers in parallel, so shipping the whole
+# ~20 GB venv as one layer serialized the export behind a single compressor. Splitting
+# also lets nodes pull the image in parallel. Keep the excludes below in sync with the
+# per-tree copies above, or the data lands in the image twice.
+# The volatile /app remainder goes last so a source edit re-pushes one layer,
+# not all of them.
+COPY --from=builder --chown=appuser:appuser /app/.venv/lib/python3.12/site-packages/nvidia /app/.venv/lib/python3.12/site-packages/nvidia
+COPY --from=builder --chown=appuser:appuser /app/.venv/lib/python3.12/site-packages/torch /app/.venv/lib/python3.12/site-packages/torch
+COPY --from=builder --chown=appuser:appuser /app/.venv/lib/python3.12/site-packages/vllm /app/.venv/lib/python3.12/site-packages/vllm
+COPY --from=builder --chown=appuser:appuser /app/.venv/lib/python3.12/site-packages/flash_attn /app/.venv/lib/python3.12/site-packages/flash_attn
+COPY --from=builder --chown=appuser:appuser /app/.venv/lib/python3.12/site-packages/flash_attn_2_cuda*.so /app/.venv/lib/python3.12/site-packages/
 COPY --from=builder /opt/ucx /opt/ucx
 
 # Copy and set up entrypoint script
 COPY --chown=appuser:appuser scripts/docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh
 
-RUN rm /app/.venv/bin/python && ln -s /usr/local/bin/python /app/.venv/bin/python
-RUN rm /app/.venv/bin/python3 && ln -s /usr/local/bin/python /app/.venv/bin/python3
-RUN rm /app/.venv/bin/python3.12 && ln -s /usr/local/bin/python /app/.venv/bin/python3.12
+COPY --from=builder --chown=appuser:appuser \
+    --exclude=.venv/lib/python3.12/site-packages/nvidia \
+    --exclude=.venv/lib/python3.12/site-packages/torch \
+    --exclude=.venv/lib/python3.12/site-packages/vllm \
+    --exclude=.venv/lib/python3.12/site-packages/flash_attn \
+    --exclude=.venv/lib/python3.12/site-packages/flash_attn_2_cuda*.so \
+    /app /app
 
 # Place executables in the environment at the front of the path
 ENV PATH="/app/.venv/bin:$PATH"

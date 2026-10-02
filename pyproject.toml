@@ -1,42 +1,40 @@
 [project]
 name = "prime-rl"
-version = "0.5.0"
+version = "0.9.0"
 description = "Async RL Training at Scale"
 readme = "README.md"
 requires-python = "~=3.12.0"
 dependencies = [
     "prime-rl-configs",
+    "prime-pydantic-config>=0.4.3",
     "beartype>=0.21.0",
     "datasets>=4.0.0",
     "jaxtyping>=0.3.2",
-    "liger-kernel>=0.5.10",
     "loguru>=0.7.3",
     "pyarrow>=21.0.0",
     "numpy>=2.2.6",
-    "torch>=2.9.0",
-    "torchvision",
-    "torchaudio",
-    "torchdata>=0.11.0",
-    "transformers",
-    "vllm>=0.21.0",
+    "transformers==5.6.2",
     "wandb>=0.26.1",
-    "ring-flash-attn>=0.1.8",
-    "prime>=0.6.4",
+    "wandb-workspaces>=0.4.3",
+    "prime>=0.8.0",
+    "prime-runs[train]>=0.1.3",
     "pyzmq>=27.1.0",
     "aiolimiter>=1.2.1",
     "tenacity>=8.2.0",
     "openai>=1.106.1",
+    "orjson>=3.11.0",
+    "psutil>=7.0.0",
+    "prometheus-client>=0.20.0",
+    "pyzstd>=0.16.2",
     "rich>=14.0.0",
     "setproctitle>=1.3.0",
     "uvloop>=0.21.0",
-    "torchtitan",
-    "verifiers",
-    "renderers",
-    "dion",
-    "tilelang>=0.1.8",
-    "flash-linear-attention",
-    "nvidia-ml-py>=12.575.51",
+    "verifiers[harbor]>=0.3.2.dev158",
+    "renderers[multimodal]>=0.1.12.dev2",
     "pybase64>=1.4.2",
+    "orjson>=3.10",
+    "pandas>=2.0",
+    "msgspec>=0.18",
 ]
 
 [project.scripts]
@@ -45,140 +43,144 @@ sft = "prime_rl.entrypoints.sft:main"
 inference = "prime_rl.entrypoints.inference:main"
 trainer = "prime_rl.entrypoints.trainer:main"
 orchestrator = "prime_rl.entrypoints.orchestrator:main"
-env-server = "prime_rl.orchestrator.env_server.env_server:main"
+eval = "prime_rl.entrypoints.eval:main"
+env-server = "prime_rl.entrypoints.env_server:main"
+dashboard = "prime_rl.entrypoints.dashboard:main"
 
 [project.entry-points."vllm.general_plugins"]
-prime_rl = "prime_rl.inference.patches:transformers_v5_compat"
+prime_rl = "prime_rl.inference.patches:apply_shared_vllm_patches"
 
 [project.optional-dependencies]
-flash-attn = [
-    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3+cu128torch2.11-cp312-cp312-linux_x86_64.whl ; platform_machine == 'x86_64'",
+gpu = [
+    "torch>=2.13.0 ; sys_platform == 'linux'",
+    "torchvision ; sys_platform == 'linux'",
+    "torchaudio ; sys_platform == 'linux'",
+    "torchdata>=0.11.0 ; sys_platform == 'linux'",
+    "vllm>=0.30.0 ; sys_platform == 'linux'",
+    "mooncake-transfer-engine>=0.3.10.post2 ; sys_platform == 'linux'",
+    "ring-flash-attn>=0.1.8 ; sys_platform == 'linux'",
+    "torchtitan ; sys_platform == 'linux'",
+    "dion ; sys_platform == 'linux'",
+    "tilelang>=0.1.8 ; sys_platform == 'linux'",
+    "flash-linear-attention ; sys_platform == 'linux'",
+    "mamba-ssm>=2.3.0 ; sys_platform == 'linux'",
+    "nvidia-ml-py>=12.575.51 ; sys_platform == 'linux'",
+    "torchao>=0.18.0 ; sys_platform == 'linux'",
+    "modelexpress==0.3.0 ; sys_platform == 'linux'",
+    "nixl-cu13==0.10.1 ; sys_platform == 'linux'",
 ]
-flash-attn-3 = ["flash_attn_3"]
+dashboard = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+]
+dynamo = ["ai-dynamo==1.4.2 ; sys_platform == 'linux'"]
+# Both wheels are the same flash-attn 2.8.3 / cu130 / torch 2.13 / cp312 build and carry
+# sm_80 / sm_90 / sm_100 / sm_120 cubins. `attn="auto"` picks FA4 on sm_100 and FA3 on
+# sm_90, so FA2 is the resolved backend on sm_120 (see `_resolve_attn_impl` in
+# trainer/model.py).
+flash-attn = [
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.47/flash_attn-2.8.3+cu130torch2.13-cp312-cp312-linux_x86_64.whl ; platform_machine == 'x86_64'",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.48/flash_attn-2.8.3+cu130torch2.13-cp312-cp312-linux_aarch64.whl ; platform_machine == 'aarch64'",
+]
+flash-attn-3 = ["flash_attn_3 ; sys_platform == 'linux'"]
 
 flash-attn-cute = [
-    "flash-attn-4",
-]
-envs = [
-    "aime2024",
-    "aime2025",
-    "alphabet-sort",
-    "code-env",
-    "color-codeword",
-    "deepdive",
-    "general-agent",
-    "gpqa",
-    "hle",
-    "ifeval",
-    "livecodebench",
-    "logic-env",
-    "math-env",
-    "math-python",
-    "math500",
-    "mini-swe-agent-plus",
-    "mini-swe-agent-plus-rlm",
-    "mmlu-pro",
-    "opencode-cp",
-    "opencode-deepdive",
-    "opencode-math",
-    "opencode-science",
-    "opencode-swe",
-    "reverse-text",
-    "science-env",
-    "simpleqa-verified",
-    "tau2-bench",
-    "wiki-search",
+    "flash-attn-4 ; sys_platform == 'linux'",
 ]
 disagg = [
-    "deep-ep ; platform_machine == 'x86_64'",
-    "deep-gemm ; platform_machine == 'x86_64'",
-    "nixl",
-    "nixl-cu12 ; platform_machine == 'x86_64'",
-    "vllm-router ; platform_machine == 'x86_64'",
-]
-gpt-oss = [
-    "kernels",
-]
-modelexpress = [
-    "modelexpress==0.3.0",
+    "deep-ep ; sys_platform == 'linux'",
+    "deep-gemm ; sys_platform == 'linux'",
+    "nixl ; sys_platform == 'linux'",
+    "nixl-cu13==0.10.1 ; sys_platform == 'linux'",
+    "vllm-router ; sys_platform == 'linux'",
 ]
 quack = [
-    "quack-kernels>=0.4.1",
+    "quack-kernels>=0.4.1 ; sys_platform == 'linux'",
+]
+sonic-moe = ["sonic-moe ; sys_platform == 'linux'"]
+# Prebuilt `prime-kernels` wheels from a release (see the `kernels` skill). Compiled for
+# sm_100a; on other GPUs the package installs fine and reports its kernels unavailable.
+kernels = [
+    "prime-kernels ; sys_platform == 'linux'",
 ]
 all = [
+    "prime-rl[gpu]",
     "prime-rl[flash-attn]",
     "prime-rl[disagg]",
     "prime-rl[quack]",
+    "prime-rl[sonic-moe]",
     "prime-rl[flash-attn-3]",
     "prime-rl[flash-attn-cute]",
 ]
 
 [dependency-groups]
 mamba-ssm = [
-    "mamba-ssm>=2.3.0",
+    "mamba-ssm>=2.3.0 ; sys_platform == 'linux'",
 ]
 dev = [
     "ipykernel>=6.29.5",
     "ipywidgets>=8.1.7",
     "pre-commit>=4.2.0",
+    "playwright>=1.49",
     "pytest>=8.4.1",
     "pytest-asyncio>=0.23",
     "ruff>=0.12.1",
 ]
 
-
-[tool.uv.workspace]
-members = [
-    "packages/prime-rl-configs",
-    "deps/pydantic-config",
-    "deps/verifiers",
-    "deps/renderers",
-    "deps/verifiers/environments/alphabet_sort",
-    "deps/verifiers/environments/math_python",
-    "deps/verifiers/environments/reverse_text",
-    "deps/verifiers/environments/wiki_search",
-    "deps/research-environments/environments/aime2024",
-    "deps/research-environments/environments/aime2025",
-    "deps/research-environments/environments/code_env",
-    "deps/research-environments/environments/color_codeword",
-    "deps/research-environments/environments/deepdive",
-    "deps/research-environments/environments/general_agent",
-    "deps/research-environments/environments/gpqa",
-    "deps/research-environments/environments/hle",
-    "deps/research-environments/environments/ifeval",
-    "deps/research-environments/environments/livecodebench",
-    "deps/research-environments/environments/logic_env",
-    "deps/research-environments/environments/math500",
-    "deps/research-environments/environments/math_env",
-    "deps/research-environments/environments/mini_swe_agent_plus",
-    "deps/research-environments/environments/mini_swe_agent_plus_rlm",
-    "deps/research-environments/environments/mmlu_pro",
-    "deps/research-environments/environments/opencode_cp",
-    "deps/research-environments/environments/opencode_deepdive",
-    "deps/research-environments/environments/opencode_math",
-    "deps/research-environments/environments/opencode_science",
-    "deps/research-environments/environments/opencode_swe",
-    "deps/research-environments/environments/science_env",
-    "deps/research-environments/environments/simpleqa_verified",
-    "deps/research-environments/environments/tau2_bench",
-]
-
 [tool.uv]
+# Enforce a uv version that supports the friendly-duration form
+# (`"7 days"`) in the static pyproject parser. Older uvs silently parse
+# the value as an RFC 3339 date, emit a TOML parse warning, and proceed
+# *without* the cooldown — bypassing this security policy.
+required-version = ">=0.11.1"
 exclude-newer = "7 days"
-preview = true
 no-build-isolation-package = ["flash-attn"]
 environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
     "sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
-# Override torch's pinned cuDNN to fix Conv3d performance regression (torch 2.9 + cuDNN 9.8-9.14)
+# Override torch's pinned cuDNN to fix the Conv3d performance regression.
 # See: https://github.com/pytorch/pytorch/issues/166122
 override-dependencies = [
-    "nvidia-cudnn-cu12>=9.15",
-    "nvidia-cutlass-dsl>=4.4.1",
-    "transformers>=5.1.0.dev0",
-    "torch>=2.9.0",
+    # Keep vLLM's TileLang version; Nemotron uses Mamba-2's Triton kernels.
+    "tilelang==0.1.12",
+    # Shared by vLLM, TileLang, and the pinned FlashAttention 4 runtime.
+    "apache-tvm-ffi==0.1.11",
+    "nvidia-cudnn-cu13>=9.15 ; sys_platform == 'linux'",
+    # vLLM 0.30.0 requires this exact CUTLASS DSL version and quack-kernels 0.6.5.
+    # Keep this pin aligned with quack-kernels and the flash-attn-4 revision below.
+    "nvidia-cutlass-dsl==4.7.1",
+    "transformers==5.6.2",
+    "torch>=2.13.0",
     "openenv-core",
+]
+
+# prime-envs packages are auto-discovered as workspace members, so new
+# envs there need no per-package registration. verifiers' example envs are opt-in:
+# only the ones prime-rl trains or tests on are listed, so an upstream example with
+# conflicting pins can't break the shared lock. Install them with
+# `uv sync --all-packages`.
+[tool.uv.workspace]
+members = [
+    "deps/prime-envs/environments/*/*",
+    "deps/verifiers/environments/alphabet_sort",
+    "deps/verifiers/environments/color_codeword",
+    "deps/verifiers/environments/gsm8k",
+    "deps/verifiers/environments/kuhn_poker",
+    "deps/verifiers/environments/proposer_solver",
+    "deps/verifiers/environments/reverse_text",
+    "deps/verifiers/environments/wiki_search",
+    "deps/verifiers/environments/wordle",
+]
+# Tau tasksets require litellm<1.82.7, while Harbor requires litellm>=1.92.0.
+# Apex pins a verifiers git revision instead of the editable workspace member.
+# A workspace shares one lock, so these packages need separate environments.
+exclude = [
+    "deps/prime-envs/environments/tool_use/tau2_bench",
+    "deps/prime-envs/environments/tool_use/tau2_synth",
+    "deps/prime-envs/environments/tool_use/tau3_bench",
+    "deps/prime-envs/environments/tool_use/apex_agents",
 ]
 
 # ModelExpress 0.3.0 publishes protobuf<6 metadata, but its generated proto is
@@ -190,109 +192,151 @@ version = "0.3.0"
 requires-dist = [
     "grpcio>=1.66.2",
     "huggingface_hub>=0.20.0",
-    "nixl[cu12]",
+    "nixl",
     "numpy>=1.24.0",
     "protobuf>=5.27.0,<7.0.0",
     "pydantic>=2.0.0",
     "torch>=2.6.0",
 ]
 
+# Mirror the upstream Pydantic compatibility correction until the next release.
+[[tool.uv.dependency-metadata]]
+name = "ai-dynamo-runtime"
+version = "1.4.2"
+requires-dist = [
+    "pydantic>=2.10.6,<=2.13.5",
+    "uvloop>=0.21.0",
+]
+
+# NIXL publishes its CUDA 12 package as a base dependency even when the
+# caller requests its CUDA 13 extra. Use the requested CUDA 13 package only.
+[[tool.uv.dependency-metadata]]
+name = "nixl"
+version = "0.10.1"
+requires-dist = ["nixl-cu13==0.10.1"]
+
+# CUTLASS DSL has the same CUDA 12 default. vLLM requests its CUDA 13 extra,
+# so resolve that variant without installing both runtime packages.
+[[tool.uv.dependency-metadata]]
+name = "nvidia-cutlass-dsl"
+version = "4.7.1"
+requires-dist = [
+    "nvidia-cutlass-dsl-libs-base==4.7.1",
+    "nvidia-cutlass-dsl-libs-cu13==4.7.1",
+]
+
 [tool.uv.exclude-newer-package]
-# we want latest vllm, remove next patch
-vllm = false
+# verifiers pins harbor==0.21.0, published minutes inside the rolling window;
+# bounded cutoff mirroring the one in deps/verifiers/pyproject.toml
+harbor = "2026-08-11T00:00:00Z"
 tokenspeed-mla = false
 fastokens = false
 flash_attn_3 = false
-# PrimeIntellect-published on PyPI (trusted publisher)
+# PrimeIntellect-published packages in this project's dependency closure —
+# fast-track so first-party releases can land same-day. Only packages that
+# appear in `uv tree` need to be listed; the resolver ignores entries for
+# packages it never sees.
 prime = false
+prime-runs = false
+prime-traces = false
 prime-sandboxes = false
 prime-tunnel = false
 prime-evals = false
+verifiers = false
+renderers = false
+prime-pydantic-config = false
 # Trusted git/URL sources pinned by rev or wheel URL (defensive: belt-and-suspenders)
 vllm-router = false
 dion = false
 deep-ep = false
 deep-gemm = false
-nixl-cu12 = false
+nixl-cu13 = false
+torchao = false
+prime-kernels = false
 
 [tool.uv.sources]
-prime-rl-configs = { workspace = true }
-verifiers = { workspace = true }
-renderers = { workspace = true }
-aime2024 = { workspace = true }
-aime2025 = { workspace = true }
-alphabet-sort = { workspace = true }
-code-env = { workspace = true }
-color-codeword = { workspace = true }
-deepdive = { workspace = true }
-general-agent = { workspace = true }
-gpqa = { workspace = true }
-hle = { workspace = true }
-ifeval = { workspace = true }
-livecodebench = { workspace = true }
-logic-env = { workspace = true }
-math-env = { workspace = true }
-math-python = { workspace = true }
-math500 = { workspace = true }
-mini-swe-agent-plus = { workspace = true }
-mini-swe-agent-plus-rlm = { workspace = true }
-mmlu-pro = { workspace = true }
-opencode-cp = { workspace = true }
-opencode-deepdive = { workspace = true }
-opencode-math = { workspace = true }
-opencode-science = { workspace = true }
-opencode-swe = { workspace = true }
-reverse-text = { workspace = true }
-science-env = { workspace = true }
-simpleqa-verified = { workspace = true }
-tau2-bench = { workspace = true }
-wiki-search = { workspace = true }
-torch = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
-torchaudio = { index = "pytorch-cu128" }
-torchtitan = { git = "https://github.com/pytorch/torchtitan", rev = "a1fdd7e" }
-dion = { git = "https://github.com/samsja/dion.git", rev = "d891eeb" }
-transformers = { git = "https://github.com/huggingface/transformers.git", rev = "c1c3424" }
-flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention.git", subdirectory = "flash_attn/cute", rev = "96bd151" }
-prime-pydantic-config = { workspace = true }
-vllm-router = { url = "https://github.com/PrimeIntellect-ai/router/releases/download/v0.1.26/vllm_router-0.1.26-cp38-abi3-manylinux_2_28_x86_64.whl" }
-vllm = [
-    { url = "https://github.com/PrimeIntellect-ai/prime-rl/releases/download/v0.5.0/vllm-0.21.0+cu129.r42434.pr39568.a106aa6-cp38-abi3-manylinux_2_34_x86_64.whl", marker = "platform_machine == 'x86_64'" },
-    { url = "https://github.com/vllm-project/vllm/releases/download/v0.21.0/vllm-0.21.0+cu129-cp38-abi3-manylinux_2_34_aarch64.whl", marker = "platform_machine == 'aarch64'" },
+prime-rl-configs = { path = "packages/prime-rl-configs", editable = true }
+# prime-rl consumes `verifiers.v1` (incl. the built-in harnesses/tasksets); env tasksets
+# live under deps/{verifiers,prime-envs}/environments.
+verifiers = { path = "deps/verifiers", editable = true }
+renderers = { path = "deps/renderers", editable = true }
+prime-pydantic-config = { path = "deps/pydantic-config", editable = true }
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux'" }]
+torchaudio = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux'" }]
+torchtitan = { git = "https://github.com/pytorch/torchtitan", rev = "23e4dfc" }
+torchao = [
+    { url = "https://github.com/PrimeIntellect-ai/prime-kernels/releases/download/v0.1.1/torchao-0.18.0+git5f2baf9d5-cp310-abi3-linux_x86_64.whl", marker = "platform_machine == 'x86_64'" },
+    { url = "https://github.com/PrimeIntellect-ai/prime-kernels/releases/download/v0.1.1/torchao-0.18.0+git5f2baf9d5-cp310-abi3-linux_aarch64.whl", marker = "platform_machine == 'aarch64'" },
 ]
-deep-ep = { url = "https://github.com/PrimeIntellect-ai/prime-rl/releases/download/v0.5.0/deep_ep-1.2.1+29d31c0-cp312-cp312-linux_x86_64.whl" }
-deep-gemm = { url = "https://github.com/PrimeIntellect-ai/prime-rl/releases/download/v0.5.0/deep_gemm-2.5.0+891d57b-cp312-cp312-linux_x86_64.whl" }
-nixl-cu12 = { url = "https://github.com/PrimeIntellect-ai/prime-rl/releases/download/v0.5.0/nixl_cu12-0.10.1-cp312-cp312-linux_x86_64.whl" }
+dion = { git = "https://github.com/samsja/dion.git", rev = "6f9242d" }
+sonic-moe = { git = "https://github.com/S1ro1/sonic-moe", rev = "0bf06ac" }
+quack-kernels = { git = "https://github.com/S1ro1/quack", rev = "f62009f" }
+flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention.git", subdirectory = "flash_attn/cute", rev = "0251105" }
+vllm-router = [
+    { url = "https://github.com/PrimeIntellect-ai/router/releases/download/v0.2.2/vllm_router-0.2.2-cp38-abi3-manylinux_2_28_x86_64.whl", marker = "platform_machine == 'x86_64'" },
+    { url = "https://github.com/PrimeIntellect-ai/router/releases/download/v0.2.2/vllm_router-0.2.2-cp38-abi3-manylinux_2_28_aarch64.whl", marker = "platform_machine == 'aarch64'" },
+]
+vllm = [
+    { url = "https://github.com/vllm-project/vllm/releases/download/v0.30.0/vllm-0.30.0-cp38-abi3-manylinux_2_28_x86_64.whl", marker = "platform_machine == 'x86_64'" },
+    { url = "https://github.com/vllm-project/vllm/releases/download/v0.30.0/vllm-0.30.0-cp38-abi3-manylinux_2_28_aarch64.whl", marker = "platform_machine == 'aarch64'" },
+]
+deep-ep = [
+    { url = "https://github.com/PrimeIntellect-ai/prime-kernels/releases/download/v0.1.1/deep_ep-1.2.1+29d31c0-cp312-cp312-linux_x86_64.whl", marker = "platform_machine == 'x86_64'" },
+    { url = "https://github.com/PrimeIntellect-ai/prime-kernels/releases/download/v0.1.1/deep_ep-1.2.1+29d31c0-cp312-cp312-linux_aarch64.whl", marker = "platform_machine == 'aarch64'" },
+]
+deep-gemm = [
+    { url = "https://github.com/PrimeIntellect-ai/prime-kernels/releases/download/v0.1.1/deep_gemm-2.5.0+891d57b-cp312-cp312-linux_x86_64.whl", marker = "platform_machine == 'x86_64'" },
+    { url = "https://github.com/PrimeIntellect-ai/prime-kernels/releases/download/v0.1.1/deep_gemm-2.5.0+891d57b-cp312-cp312-linux_aarch64.whl", marker = "platform_machine == 'aarch64'" },
+]
+prime-kernels = [
+    { url = "https://github.com/PrimeIntellect-ai/prime-kernels/releases/download/v0.1.1/prime_kernels-0.1.0+cu130torch2.13.0-cp312-cp312-linux_x86_64.whl", marker = "platform_machine == 'x86_64'" },
+    { url = "https://github.com/PrimeIntellect-ai/prime-kernels/releases/download/v0.1.1/prime_kernels-0.1.0+cu130torch2.13.0-cp312-cp312-linux_aarch64.whl", marker = "platform_machine == 'aarch64'" },
+]
 flash-linear-attention = { git = "https://github.com/fla-org/flash-linear-attention" }
-flash_attn_3 = { index = "pytorch-cu128-test" }
+mamba-ssm = { git = "https://github.com/state-spaces/mamba", rev = "f577286" }
+flash_attn_3 = { index = "pytorch-cu130-test" }
 
 [tool.uv.extra-build-dependencies]
 flash-attn = [{ requirement = "torch", match-runtime = true }]
 flash-attn-3 = [{ requirement = "torch", match-runtime = true }]
-mamba-ssm = [{ requirement = "torch", match-runtime = true }]
+mamba-ssm = ["torch>=2.13.0"]
 
 [tool.uv.extra-build-variables]
 flash-attn = { FLASH_ATTENTION_SKIP_CUDA_BUILD = "TRUE" }
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [[tool.uv.index]]
-name = "pytorch-cu128-test"
-url = "https://download.pytorch.org/whl/test/cu128"
+name = "pytorch-cu130-test"
+url = "https://download.pytorch.org/whl/test/cu130"
 explicit = true
+
+# Environments Hub wheels carry no upload time, so the exclude-newer cooldown
+# would reject every one of them. The Hub is first-party: skip the cutoff there.
+[[tool.uv.index]]
+name = "prime-hub"
+url = "https://hub.primeintellect.ai/primeintellect/simple/"
+explicit = true
+exclude-newer = false
 
 [tool.ruff.lint]
 select = ["F", "I"]
-ignore = ["F722", "F821"] # Need to ignore for jaxtyping (https://docs.kidger.site/jaxtyping/faq/)
+
+# jaxtyping writes shapes as string annotations (`Int[Tensor, "batch seq"]`), which ruff reads as
+# forward references and reports as syntax errors / undefined names.
+[tool.ruff.lint.per-file-ignores]
+"src/prime_rl/trainer/model.py" = ["F722", "F821"]
+"src/prime_rl/trainer/rl/data.py" = ["F722", "F821"]
+"src/prime_rl/trainer/rl/loss.py" = ["F722", "F821"]
+"src/prime_rl/trainer/sft/data.py" = ["F722", "F821"]
 
 [tool.ruff.lint.isort]
-# `prime_rl` is split across two workspace wheels (prime-rl + prime-rl-configs).
-# Without this, ruff classifies prime_rl.configs.* as third-party because it
-# doesn't live under src/.
 known-first-party = ["prime_rl"]
+known-third-party = ["verifiers", "renderers", "pydantic_config"]
 
 [tool.ruff]
 line-length = 120

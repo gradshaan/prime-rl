@@ -1,0 +1,301 @@
+<!-- This package is fully AI-generated and maintained by agents - it is not meant to be read or edited by humans. Change it by asking an agent, and verify through the browser smoke tests. -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>prime-rl dashboard</title>
+<link rel="icon" href="/static/butterfly-white.svg">
+<link rel="stylesheet" href="/static/vendor/uPlot.min.css">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">
+    <img src="/static/butterfly-white.svg" alt="Prime Intellect">
+  </div>
+  <select id="run-select" title="run"></select>
+  <div id="compare-wrap" class="dd-wrap">
+    <button id="compare-btn" class="btn dd-btn">compare</button>
+    <div id="compare-menu" class="dd-menu" hidden></div>
+  </div>
+  <nav id="tabs">
+    <button data-tab="config">Config</button>
+    <button data-tab="overview" class="active">Overview</button>
+    <button data-tab="metrics">Metrics</button>
+    <button data-tab="traces">Traces</button>
+    <button data-tab="report">Report</button>
+    <button data-tab="logs">Logs</button>
+  </nav>
+  <label class="toggle" title="apply agent view commands as they arrive"><input type="checkbox" id="follow-toggle" checked><span class="dot"></span>follow</label>
+  <label class="toggle" title="poll for updates"><input type="checkbox" id="live-toggle" checked><span class="dot"></span>live</label>
+  <div id="platform-wrap" class="dd-wrap" hidden>
+    <a id="platform-link" class="btn platform" target="_blank" rel="noopener">view on platform<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 17L17 7M9 7h8v8"></path></svg></a>
+    <button id="platform-btn" class="btn dd-btn platform" hidden>view on platform</button>
+    <div class="dd-menu" id="platform-menu" hidden></div>
+  </div>
+</header>
+
+<div id="run-overview"></div>
+
+<main>
+  <section id="tab-overview">
+    <div class="controls">
+      <div id="overview-filter-wrap" class="dd-wrap flt-wrap"></div>
+      <input id="overview-search" class="search" type="search" placeholder="regex filter, e.g. reward or ^inference/">
+      <label class="ctl">smooth <input id="overview-smooth" type="range" min="1" max="50" value="1"><span id="overview-smooth-val">off</span></label>
+      <span id="overview-status" class="muted"></span>
+    </div>
+    <div id="overview-body"></div>
+    <div id="swarm-tip" hidden></div>
+  </section>
+
+  <section id="tab-metrics" hidden>
+    <div class="controls">
+      <input id="metrics-search" class="search" type="search" placeholder="regex filter, e.g. ^entropy/ or reward">
+      <label class="ctl">smooth <input id="metrics-smooth" type="range" min="1" max="50" value="1"><span id="metrics-smooth-val">off</span></label>
+      <span id="metrics-status" class="muted"></span>
+      <div class="spacer"></div>
+      <div class="seg" id="metrics-layout">
+        <button data-layout="flat">Flat</button>
+        <button data-layout="nested">Nested</button>
+      </div>
+      <button id="metrics-collapse" class="btn">collapse</button>
+      <button id="metrics-expand" class="btn">expand</button>
+    </div>
+    <div id="metrics-body"></div>
+  </section>
+
+  <section id="tab-config" hidden>
+    <div class="controls">
+      <label class="t-label">attempt</label>
+      <select id="config-attempt-select"></select>
+      <div class="seg" id="config-format">
+        <button data-fmt="toml">TOML</button>
+        <button data-fmt="json">JSON</button>
+      </div>
+      <input id="config-search" class="search" type="search" placeholder="regex search, e.g. lora|lr">
+      <span id="config-hits" class="muted"></span>
+    </div>
+    <div id="config-command">
+      <div class="config-command-head">
+        <span class="t-label">command</span>
+        <button id="config-command-copy" class="btn" type="button">copy</button>
+      </div>
+      <div class="config-command-body">
+        <span class="config-command-prompt" aria-hidden="true">$</span>
+        <code id="config-command-text"></code>
+      </div>
+    </div>
+    <pre id="config-view"></pre>
+  </section>
+
+  <section id="tab-traces" hidden>
+    <div class="controls" id="trace-bar">
+      <div class="seg" id="trace-mode">
+        <button data-mode="stream" class="active" title="every episode, newest first">Stream</button>
+        <button data-mode="step" title="the cohort shipped at one step">Step</button>
+      </div>
+      <div id="trace-filter-wrap" class="dd-wrap flt-wrap"></div>
+      <select id="trace-sort" title="sort" data-label="sort">
+        <option value="arrival:desc">arrival ↓</option>
+        <option value="arrival:asc">arrival ↑</option>
+        <option value="group:asc">group</option>
+        <option value="duration:desc">total time ↓</option>
+        <option value="duration:asc">total time ↑</option>
+        <option value="reward:desc">reward ↓</option>
+        <option value="reward:asc">reward ↑</option>
+        <option value="output_tokens:desc">tokens ↓</option>
+      </select>
+      <span id="trace-status" class="muted"></span>
+      <div class="spacer"></div>
+      <button id="trace-clear-bin" class="btn" hidden>clear selection</button>
+    </div>
+    <div class="controls" id="step-bar" hidden>
+      <button id="step-prev" class="btn tm-nav" title="previous step">‹</button>
+      <div id="step-blocks"></div>
+      <button id="step-next" class="btn tm-nav" title="next step">›</button>
+      <span id="step-label" class="t-label"></span>
+    </div>
+    <div id="trace-chart">
+      <div class="chart-head"><span class="chart-title">Episodes finished</span><span id="trace-chart-sub" class="muted"></span></div>
+      <div id="trace-hist"></div>
+      <div id="hist-tip" hidden></div>
+    </div>
+    <div id="episode-table-wrap">
+      <table id="episode-table">
+        <colgroup>
+          <col class="c-line"><col class="c-phase"><col class="c-span"><col class="c-kind"><col class="c-env"><col class="c-group">
+          <col class="c-tok"><col class="c-turns"><col class="c-branches"><col class="c-stop"><col class="c-reward">
+        </colgroup>
+        <thead><tr>
+          <th>#</th><th>phase</th><th title="when the rollout was dispatched, when its episode arrived, and how long that took (or has taken so far)">dispatched → arrived</th><th>kind</th><th>env</th><th>group</th>
+          <th>tok</th><th>turns</th><th>branches</th><th>stop</th><th>reward</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="tab-report" hidden>
+    <div class="controls">
+      <label class="t-label">report</label>
+      <select id="report-select"></select>
+      <span id="report-verify" class="muted"></span>
+      <div class="spacer"></div>
+      <span id="report-status" class="muted"></span>
+    </div>
+    <div id="report-wrap"><article id="report-body"></article></div>
+  </section>
+
+  <section id="tab-logs" hidden>
+    <div class="controls">
+      <label class="t-label">attempt</label>
+      <select id="attempt-select"></select>
+      <div id="log-comp-wrap" class="dd-wrap">
+        <button id="log-comp-btn" class="btn dd-btn">components</button>
+        <div id="log-comp-menu" class="dd-menu" hidden></div>
+      </div>
+      <div class="seg" id="log-view">
+        <button data-view="merge" class="active">Merge</button>
+        <button data-view="split">Split</button>
+      </div>
+      <div class="stepper" id="log-level" title="minimum log level">
+        <button id="log-level-down" title="more verbose">‹</button>
+        <span id="log-level-label">all</span>
+        <button id="log-level-up" title="less verbose">›</button>
+      </div>
+      <input id="log-search" class="search" type="search" placeholder="regex filter, e.g. ERROR|WARN">
+      <button id="log-older" class="btn">load older</button>
+    </div>
+    <div id="log-panes"></div>
+  </section>
+</main>
+
+<div id="drawer-backdrop" hidden></div>
+<div id="trace-modal" hidden>
+  <aside id="tm-left">
+    <div class="tm-head tm-stephead" id="tm-stephead">
+      <button id="tm-step-prev" class="btn tm-nav" title="previous step">‹</button>
+      <span id="tm-step-label"></span><span id="tm-live-label" class="muted"></span>
+      <button id="tm-step-next" class="btn tm-nav" title="next step">›</button>
+    </div>
+    <div class="tm-head tm-ctlrow">
+      <div id="tm-filter-wrap" class="dd-wrap flt-wrap"></div>
+      <select id="tm-sort" title="sort" data-label="sort">
+        <option value="arrival:desc">arrival ↓</option>
+        <option value="arrival:asc">arrival ↑</option>
+        <option value="group:asc">group</option>
+        <option value="duration:desc">total time ↓</option>
+        <option value="duration:asc">total time ↑</option>
+        <option value="reward:desc">reward ↓</option>
+        <option value="reward:asc">reward ↑</option>
+        <option value="output_tokens:desc">tokens ↓</option>
+      </select>
+    </div>
+    <div class="tm-head tm-ctlrow" id="tm-mode-row">
+      <div class="seg" id="tm-mode">
+        <button data-mode="stream">Stream</button>
+        <button data-mode="step">Step</button>
+      </div>
+    </div>
+    <div class="tm-head">
+      <span class="t-label">episodes</span>
+      <span id="tm-count" class="badge"></span>
+    </div>
+    <div id="tm-list"></div>
+  </aside>
+  <section id="tm-main">
+    <div class="tm-head">
+      <span class="tm-title">Trace Viewer</span>
+      <button id="tm-back" class="btn" hidden title="back to the report">← report</button>
+      <div class="seg" id="tm-view">
+        <button data-view="transcript" class="active">Transcript</button>
+        <button data-view="timeline">Timeline</button>
+        <button data-view="replay">Replay</button>
+        <button data-view="semantic">Semantic</button>
+      </div>
+      <div id="tm-semantic-nav" class="tm-semantic-nav" hidden>
+        <button id="tm-episode-prev" class="btn tm-nav" title="previous episode">‹</button>
+        <span id="tm-episode-label"></span>
+        <button id="tm-episode-next" class="btn tm-nav" title="next episode">›</button>
+      </div>
+      <div class="spacer"></div>
+      <div class="seg" id="trace-view-mode">
+        <button data-mode="messages" class="active">Messages</button>
+        <button data-mode="rendered">Rendered</button>
+      </div>
+      <select id="token-signal" title="Choose the token signal for either view. Text is uncolored; other options color recorded tokens by advantage, loss/content mask membership, or the trainer's annotations (entropy, the mismatch between its recomputed logprobs and the sampling ones, and the IPO stable mask).">
+        <option value="">Text</option>
+        <option value="advantage">Advantage</option>
+        <option value="entropy">Entropy</option>
+        <option value="mismatch_kl">Mismatch</option>
+        <option value="stable_mask">Stable mask</option>
+        <option value="mask">Loss Mask</option>
+        <option value="is_content">Content Mask</option>
+      </select>
+      <button id="tm-collapse" class="btn">collapse</button>
+      <button id="tm-expand" class="btn">expand</button>
+      <button id="drawer-close" class="btn">✕</button>
+    </div>
+    <div id="tm-episode-errors" hidden></div>
+    <div class="tm-head tm-tabs-row" id="tm-tabs-row" hidden>
+      <div id="tm-trace-tabs" class="seg" hidden></div>
+      <div id="tm-branch-tabs" class="seg" hidden></div>
+      <div id="tm-evidence-tabs" class="seg" hidden></div>
+    </div>
+    <div id="tm-messages"></div>
+    <div id="tm-timeline" hidden></div>
+    <aside id="sg-inspector" hidden>
+      <div class="sg-inspector-head">
+        <span id="sg-inspector-title">Model call</span>
+        <button id="sg-inspector-close" class="btn" title="close inspector">✕</button>
+      </div>
+      <div id="sg-inspector-body"></div>
+      <button id="sg-open-transcript" class="btn">open in transcript</button>
+    </aside>
+  </section>
+  <aside id="tm-right">
+    <div class="tm-head"><span class="tm-title">Overview</span></div>
+    <div id="tm-meta"></div>
+  </aside>
+</div>
+
+<!-- one filter over every view: the overview, the traces table and the trace viewer
+     each host a copy, and a change in any of them shows up in all -->
+<template id="filter-tpl">
+  <button class="btn dd-btn flt-btn" title="filter">
+    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 5h18l-7 8v6l-4-2v-4L3 5z"></path></svg>
+    filter
+    <span class="badge flt-count" hidden></span>
+  </button>
+  <div class="dd-menu dd-filters" hidden>
+    <div class="dd-sec">filter</div>
+    <div class="dd-row flt-status-row"><span class="t-label">status</span>
+      <div class="seg toggle-seg flt-status">
+        <button data-status="live" class="on" title="live rollouts, streamed by their env servers">live</button>
+        <button data-status="done" class="on" title="episodes in the finished stream">completed</button>
+      </div>
+    </div>
+    <div class="dd-row"><span class="t-label">kind</span>
+      <div class="seg toggle-seg flt-kinds">
+        <button data-kind="train" class="on">train</button>
+        <button data-kind="eval" class="on">eval</button>
+      </div>
+    </div>
+    <label class="dd-row"><span class="t-label">env</span>
+      <select class="flt-env"><option value="">all envs</option></select>
+    </label>
+    <div class="dd-row"><span class="t-label">outcome</span>
+      <div class="seg toggle-seg flt-outcome">
+        <button data-outcome="ok" class="on" title="episodes that finished without an error">ok</button>
+        <button data-outcome="error" class="on" title="episodes that errored">error</button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script src="/static/vendor/uPlot.iife.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

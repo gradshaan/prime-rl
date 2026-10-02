@@ -1,16 +1,20 @@
 from pathlib import Path
 from typing import TypedDict
 
+import numpy as np
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
-from transformers.tokenization_utils import PreTrainedTokenizer
 
 from prime_rl.configs.trainer import FakeDataLoaderConfig
-from prime_rl.trainer.rl.packer import BasePacker, setup_packer
-from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.trainer.world import get_world
-from prime_rl.transport import MicroBatch, MicroBatchReceiver, TransportConfig, setup_micro_batch_receiver
+from prime_rl.transports.batch import (
+    BatchReceiver,
+    MicroBatch,
+    MMRefs,
+    TransportConfig,
+    setup_batch_receiver,
+)
 
 
 class TensorMicroBatch(TypedDict):
@@ -20,31 +24,39 @@ class TensorMicroBatch(TypedDict):
     input_ids: Int[Tensor, "batch seq"]
     position_ids: Int[Tensor, "batch seq"]
     advantages: Float[Tensor, "batch seq"]
-    rewards: Float[Tensor, "batch seq"] | None
     inference_logprobs: Float[Tensor, "batch seq"]
-    teacher_logprobs: Float[Tensor, "batch seq"] | None
+    ref_logprobs: Float[Tensor, "batch seq"] | None
     loss_mask: Bool[Tensor, "batch seq"]
     temperatures: Float[Tensor, "batch seq"]  # Per-token temperatures
     env_names: list[str]
+    sequence_lengths: list[int]
+
+    # Per-sequence branch identity, parallel to sequence_lengths; None on
+    # synthetic data. "" / -1 mark an unknown sequence (e.g. a dummy batch).
+    trace_ids: list[str] | None
+    branch_indices: list[int] | None
 
     # Batch level
     lora_num_tokens: Int[Tensor, "n_loras"]
+    seq_lens: Int[Tensor, "segments"]
 
     # MoE router replay
     routed_experts: Int[Tensor, "batch seq layers topk"] | None
 
-    # Generic multimodal kwargs — flat dict matching the model's forward
-    # signature (e.g. ``{"pixel_values": ..., "image_grid_thw": ...}`` for
-    # Qwen3-VL; ``{"pixel_values": ...}`` for Gemma3-VL). The trainer
-    # ``**`` -unpacks this into the forward call, so any HF VLM whose
-    # processor and forward agree on kwarg names works out of the box.
-    mm_kwargs: dict[str, Tensor] | None
+    # Sampling-mask token ids per position, padded with -1 to the micro batch's
+    # maximum mask size. A row containing only -1 has no mask.
+    sampling_mask: Int[Tensor, "batch seq mask"] | None
+
+    # Materialized immediately before this microbatch's forward pass.
+    mm_refs: MMRefs | None
     # mm_token_type_ids: token type per token [batch seq], int64 (0=text, 1=image, 2=video)
     mm_token_type_ids: Int[Tensor, "batch seq"] | None
 
-    # Selects loss dispatch (rl/opd → default loss with mode-specific taus,
-    # sft → sft loss). All samples in a micro batch share the same mode.
-    training_mode: str
+    # Per-token component weight streams. ``None`` means absent: no ce/ref_kl
+    # component, rl weight 1.0 on every loss-masked token.
+    rl_weights: Float[Tensor, "batch seq"] | None
+    ce_weights: Float[Tensor, "batch seq"] | None
+    ref_kl_weights: Float[Tensor, "batch seq"] | None
 
 
 class FakeDataLoader:
@@ -59,7 +71,6 @@ class FakeDataLoader:
         self.seq_len = seq_len
         self.generate_samples = config.generate_samples
         self.batch_counter = 0
-        self.multi_run_manager = get_multi_run_manager()
 
     def wait_for_batch(self) -> None:
         return
@@ -84,6 +95,7 @@ class FakeDataLoader:
         total_seq_len = 0
         input_ids = []
         position_ids = []
+        sequence_lengths = []
 
         while total_seq_len < self.seq_len:
             # Generate reasonably long documents
@@ -91,6 +103,7 @@ class FakeDataLoader:
             if seq_len_to_generate + total_seq_len > self.seq_len:
                 seq_len_to_generate = self.seq_len - total_seq_len
             total_seq_len += seq_len_to_generate
+            sequence_lengths.append(seq_len_to_generate)
             tmp_input_ids = torch.randint(0, 120000, (seq_len_to_generate,), generator=generator).long()
             tmp_position_ids = torch.arange(seq_len_to_generate).long()
 
@@ -102,29 +115,31 @@ class FakeDataLoader:
         loss_mask = torch.ones(input_ids.shape[0], dtype=torch.bool)
         advantages = torch.randn(input_ids.shape[0], generator=generator)
         inference_logprobs = torch.randn(input_ids.shape[0], generator=generator)
-        lora_num_tokens = torch.zeros(self.multi_run_manager.max_runs, dtype=torch.int32)
-        lora_num_tokens[0] = input_ids.shape[0]
 
         return {
             "input_ids": input_ids.unsqueeze(0),
             "position_ids": position_ids.unsqueeze(0),
             "advantages": advantages.unsqueeze(0),
-            "rewards": None,
             "inference_logprobs": inference_logprobs.unsqueeze(0),
-            "teacher_logprobs": None,
+            "ref_logprobs": None,
             "temperatures": torch.ones(input_ids.shape[0]).unsqueeze(0),
             "env_names": ["fake"] * input_ids.shape[0],
+            "sequence_lengths": sequence_lengths,
+            "trace_ids": None,
+            "branch_indices": None,
             "loss_mask": loss_mask.unsqueeze(0),
-            "lora_num_tokens": lora_num_tokens,
+            "lora_num_tokens": torch.tensor([input_ids.shape[0]], dtype=torch.int32),
+            "seq_lens": torch.tensor(sequence_lengths, dtype=torch.long),
             "routed_experts": None,
-            "mm_kwargs": None,
+            "sampling_mask": None,
+            "mm_refs": None,
             "mm_token_type_ids": None,
-            "training_mode": "rl",
+            "rl_weights": None,
+            "ce_weights": None,
+            "ref_kl_weights": None,
         }
 
     def _get_micro_batch(self, generator: torch.Generator) -> TensorMicroBatch:
-        lora_num_tokens = torch.zeros(self.multi_run_manager.max_runs, dtype=torch.int32)
-        lora_num_tokens[0] = self.seq_len
         return {
             "input_ids": torch.randint(
                 0,
@@ -137,60 +152,45 @@ class FakeDataLoader:
             ),
             "position_ids": torch.cat([torch.arange(self.seq_len)]).unsqueeze(0),
             "advantages": torch.randn(self.seq_len, generator=generator).unsqueeze(0),
-            "rewards": None,
             "inference_logprobs": torch.randn(self.seq_len, generator=generator).unsqueeze(0),
-            "teacher_logprobs": None,
+            "ref_logprobs": None,
             "temperatures": torch.ones(self.seq_len).unsqueeze(0),
             "env_names": ["fake"] * self.seq_len,
+            "sequence_lengths": [self.seq_len],
+            "trace_ids": None,
+            "branch_indices": None,
             "loss_mask": torch.ones(self.seq_len, dtype=torch.bool).unsqueeze(0),
-            "lora_num_tokens": lora_num_tokens,
+            "lora_num_tokens": torch.tensor([self.seq_len], dtype=torch.int32),
+            "seq_lens": torch.tensor([self.seq_len], dtype=torch.long),
             "routed_experts": None,
-            "mm_kwargs": None,
+            "sampling_mask": None,
+            "mm_refs": None,
             "mm_token_type_ids": None,
-            "training_mode": "rl",
+            "rl_weights": None,
+            "ce_weights": None,
+            "ref_kl_weights": None,
         }
 
 
 class DataLoader:
-    """Loads serialized data from a data path written by the orchestrator."""
+    """Receives packed micro batches from the orchestrator, one stream per DP rank."""
 
     def __init__(
         self,
         output_dir: Path,
         start_step: int,
         dp_world_size: int,
-        seq_len: int,
-        pad_to_multiple_of: int,
-        tokenizer: PreTrainedTokenizer,
         config: TransportConfig,
     ):
         self.world = get_world()
 
-        if self.world.is_master:
-            self.packer: BasePacker = setup_packer(
-                dp_world_size=dp_world_size,
-                seq_len=seq_len,
-                tokenizer=tokenizer,
-                transport_config=config,
-                pad_to_multiple_of=pad_to_multiple_of,
-                start_step=start_step,
-            )
-
         non_dp_world_size = self.world.world_size // dp_world_size
         dp_rank = self.world.rank // non_dp_world_size
-        self.multi_run_manager = get_multi_run_manager()
 
-        self.receiver: MicroBatchReceiver = setup_micro_batch_receiver(output_dir, dp_rank, start_step, config)
+        self.receiver: BatchReceiver = setup_batch_receiver(output_dir, dp_rank, start_step, config)
 
     def wait_for_batch(self) -> None:
-        if self.world.is_master:
-            self.packer._arm_watchdog()
-            try:
-                self.packer.pack()
-            finally:
-                self.packer._disarm_watchdog()
         self.receiver.wait()
-        self.multi_run_manager.synchronize_state()
 
     def get_batch(self) -> list[TensorMicroBatch]:
         micro_batches = self.receiver.receive()
@@ -198,18 +198,6 @@ class DataLoader:
 
     def _micro_batch_to_tensor(self, micro_batch: MicroBatch) -> TensorMicroBatch:
         """Convert a MicroBatch (msgspec struct with lists) to a TensorMicroBatch (dict with tensors)."""
-        if micro_batch.lora_num_tokens is None:
-            micro_batch.lora_num_tokens = [0] * self.multi_run_manager.max_runs
-            micro_batch.lora_num_tokens[0] = len(micro_batch.input_ids)
-        mm_kwargs: dict[str, Tensor] | None = None
-        if micro_batch.mm_kwargs:
-            # Each value is an EncodedTensor (dtype, shape, raw bytes).
-            # No batch dim — the orchestrator concatenates per-image along
-            # dim=0 generically, matching what each HF VLM's forward expects.
-            mm_kwargs = {
-                key: torch.frombuffer(bytearray(payload.data), dtype=_torch_dtype(payload.dtype)).reshape(payload.shape)
-                for key, payload in micro_batch.mm_kwargs.items()
-            }
         routed_experts = None
         packed_routed_experts = micro_batch.routed_experts
         if packed_routed_experts is not None:
@@ -222,27 +210,48 @@ class DataLoader:
                 .to(torch.int32)
                 .unsqueeze(0)
             )
+        sampling_mask = None
+        packed_sampling_mask = micro_batch.sampling_mask
+        if packed_sampling_mask is not None:
+            counts = np.frombuffer(packed_sampling_mask.counts, dtype=np.int32)
+            ids = np.frombuffer(packed_sampling_mask.ids, dtype=np.int32)
+            # Boolean assignment fills row-major, matching the flat concat order.
+            max_mask_size = max(int(counts.max()), 1) if counts.size else 1
+            padded = np.full((len(counts), max_mask_size), -1, dtype=np.int32)
+            padded[np.arange(max_mask_size)[None, :] < counts[:, None]] = ids
+            sampling_mask = torch.from_numpy(padded).unsqueeze(0)
         return TensorMicroBatch(
             input_ids=torch.tensor(micro_batch.input_ids, dtype=torch.long).unsqueeze(0),
             position_ids=torch.tensor(micro_batch.position_ids, dtype=torch.long).unsqueeze(0),
             advantages=torch.tensor(micro_batch.advantages, dtype=torch.float).unsqueeze(0),
-            rewards=torch.tensor(micro_batch.rewards, dtype=torch.float).unsqueeze(0)
-            if micro_batch.rewards is not None
-            else None,
             inference_logprobs=torch.tensor(micro_batch.inference_logprobs, dtype=torch.float).unsqueeze(0),
-            teacher_logprobs=torch.tensor(micro_batch.teacher_logprobs, dtype=torch.float).unsqueeze(0)
-            if micro_batch.teacher_logprobs is not None
+            ref_logprobs=torch.tensor(micro_batch.ref_logprobs, dtype=torch.float).unsqueeze(0)
+            if micro_batch.ref_logprobs is not None
             else None,
             loss_mask=torch.tensor(micro_batch.loss_mask, dtype=torch.bool).unsqueeze(0),
             temperatures=torch.tensor(micro_batch.temperatures, dtype=torch.float).unsqueeze(0),
             env_names=micro_batch.env_names,
-            lora_num_tokens=torch.tensor(micro_batch.lora_num_tokens, dtype=torch.int32),
-            mm_kwargs=mm_kwargs,
+            sequence_lengths=micro_batch.sequence_lengths,
+            trace_ids=micro_batch.trace_ids,
+            branch_indices=micro_batch.branch_indices,
+            # Single adapter: every token in the batch belongs to it (padding included).
+            lora_num_tokens=torch.tensor([len(micro_batch.input_ids)], dtype=torch.int32),
+            seq_lens=torch.tensor(micro_batch.seq_lens, dtype=torch.long),
+            mm_refs=micro_batch.mm_refs,
             mm_token_type_ids=torch.tensor(micro_batch.mm_token_type_ids, dtype=torch.long).unsqueeze(0)
             if micro_batch.mm_token_type_ids is not None
             else None,
             routed_experts=routed_experts,
-            training_mode=micro_batch.training_mode,
+            sampling_mask=sampling_mask,
+            rl_weights=torch.tensor(micro_batch.rl_weights, dtype=torch.float).unsqueeze(0)
+            if micro_batch.rl_weights is not None
+            else None,
+            ce_weights=torch.tensor(micro_batch.ce_weights, dtype=torch.float).unsqueeze(0)
+            if micro_batch.ce_weights is not None
+            else None,
+            ref_kl_weights=torch.tensor(micro_batch.ref_kl_weights, dtype=torch.float).unsqueeze(0)
+            if micro_batch.ref_kl_weights is not None
+            else None,
         )
 
 

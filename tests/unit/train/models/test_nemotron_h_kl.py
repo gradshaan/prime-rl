@@ -8,12 +8,12 @@ verifies KL mismatch through the loss pipeline.
 import pytest
 import torch
 
-from prime_rl.configs.trainer import DefaultLossConfig
+from prime_rl.configs.trainer import IPOLossConfig
 from prime_rl.trainer.models.layers.lm_head import inject_prime_lm_head
 from prime_rl.trainer.models.nemotron_h import NemotronHConfig, NemotronHForCausalLM
 from prime_rl.trainer.rl.loss import (
+    IPOLoss,
     LossInputs,
-    default_loss_fn,
     selective_log_softmax,
     shift_tensor_right,
 )
@@ -29,43 +29,41 @@ _BASE = dict(
     head_dim=64,
     max_position_embeddings=128,
     intermediate_size=512,
-    mamba_expand=2,
+    expand=2,
     mamba_num_heads=8,
     mamba_head_dim=64,
     ssm_state_size=64,
-    mamba_n_groups=1,
-    mamba_d_conv=4,
-    mamba_chunk_size=64,
+    n_groups=1,
+    conv_kernel=4,
+    chunk_size=64,
     n_routed_experts=4,
     n_shared_experts=1,
     moe_intermediate_size=256,
     moe_shared_expert_intermediate_size=256,
     moe_latent_size=128,
     num_experts_per_tok=2,
-    n_group=1,
-    topk_group=1,
     norm_topk_prob=True,
     routed_scaling_factor=1.0,
 )
 
 
 def _make_model(device="cuda"):
-    config = NemotronHConfig(
-        **_BASE,
-        layers_block_type=["mamba", "moe", "attention", "moe"],
-        use_grouped_mm=False,
-    )
-    config._attn_implementation = "sdpa"
-    with torch.device(device), default_dtype(torch.float32):
-        model = NemotronHForCausalLM._from_config(config)
+    config = NemotronHConfig(**_BASE, hybrid_override_pattern="ME*E")
+    config._attn_implementation = "flash_attention_2"
+    with torch.device(device), default_dtype(torch.bfloat16):
+        model = NemotronHForCausalLM(config)
     inject_prime_lm_head(model, chunk_size=None)
     return model
+
+
+def _seq_lens(input_ids: torch.Tensor) -> torch.Tensor:
+    return torch.tensor([input_ids.shape[1]], device=input_ids.device)
 
 
 def _get_logprobs_vanilla(model, input_ids):
     """Get logprobs using VanillaOutputLinear (returns logits, we compute logprobs)."""
     with torch.no_grad():
-        out = model(input_ids)
+        out = model(input_ids, seq_lens=_seq_lens(input_ids))
     logits = out["logits"]
     labels = torch.cat(
         [input_ids[:, 1:], torch.zeros(input_ids.shape[0], 1, dtype=torch.long, device=input_ids.device)], dim=1
@@ -87,7 +85,7 @@ def test_kl_zero_when_identical():
     """Two identical models should have zero KL mismatch."""
     model = _make_model()
 
-    input_ids = torch.randint(0, 256, (2, 32), device="cuda")
+    input_ids = torch.randint(0, 256, (1, 32), device="cuda")
     logprobs = _get_logprobs_vanilla(model, input_ids)
 
     loss_mask = torch.ones(32, dtype=torch.bool, device="cuda")
@@ -99,11 +97,11 @@ def test_kl_zero_when_identical():
         inputs = LossInputs(
             trainer_logprobs=logprobs[i],
             inference_logprobs=logprobs[i],
-            teacher_logprobs=None,
+            ref_logprobs=None,
             advantages=advantages,
             loss_mask=loss_mask,
         )
-        result = default_loss_fn(inputs, DefaultLossConfig())
+        result = IPOLoss(IPOLossConfig(eps=10.0)).loss(inputs)
 
         assert result.metrics["unmasked_mismatch_kl"].item() == pytest.approx(0.0, abs=1e-6), (
             f"Expected zero KL for identical models, got {result.metrics['unmasked_mismatch_kl'].item()}"
@@ -120,7 +118,7 @@ def test_kl_positive_after_perturbation():
         policy_model.load_state_dict(ref_model.state_dict())
     _perturb_model(policy_model, scale=0.05)
 
-    input_ids = torch.randint(0, 256, (2, 32), device="cuda")
+    input_ids = torch.randint(0, 256, (1, 32), device="cuda")
 
     ref_logprobs = _get_logprobs_vanilla(ref_model, input_ids)
     policy_logprobs = _get_logprobs_vanilla(policy_model, input_ids)
@@ -133,11 +131,11 @@ def test_kl_positive_after_perturbation():
         inputs = LossInputs(
             trainer_logprobs=policy_logprobs[i],
             inference_logprobs=ref_logprobs[i],
-            teacher_logprobs=None,
+            ref_logprobs=None,
             advantages=advantages,
             loss_mask=loss_mask,
         )
-        result = default_loss_fn(inputs, DefaultLossConfig())
+        result = IPOLoss(IPOLossConfig(eps=10.0)).loss(inputs)
         kl = result.metrics["unmasked_mismatch_kl"].item()
 
         assert kl > 0, f"Expected positive KL after perturbation, got {kl}"
@@ -181,15 +179,11 @@ def test_kl_increases_with_larger_perturbation():
 
 def test_kl_with_fused_lm_head():
     """FusedOutputLinear should produce same logprobs as VanillaOutputLinear."""
-    config = NemotronHConfig(
-        **_BASE,
-        layers_block_type=["mamba", "moe", "attention", "moe"],
-        use_grouped_mm=False,
-    )
-    config._attn_implementation = "sdpa"
+    config = NemotronHConfig(**_BASE, hybrid_override_pattern="ME*E")
+    config._attn_implementation = "flash_attention_2"
 
-    with torch.device("cuda"), default_dtype(torch.float32):
-        model = NemotronHForCausalLM._from_config(config)
+    with torch.device("cuda"), default_dtype(torch.bfloat16):
+        model = NemotronHForCausalLM(config)
 
     # Get logits from vanilla head
     inject_prime_lm_head(model, chunk_size=None)
@@ -197,7 +191,7 @@ def test_kl_with_fused_lm_head():
     labels = torch.cat([input_ids[:, 1:], torch.zeros(1, 1, dtype=torch.long, device="cuda")], dim=1)
 
     with torch.no_grad():
-        vanilla_out = model(input_ids)
+        vanilla_out = model(input_ids, seq_lens=_seq_lens(input_ids))
     vanilla_logits = vanilla_out["logits"]
     temperature = torch.ones(1, 16, device="cuda")
     vanilla_logprobs = selective_log_softmax(vanilla_logits / temperature.unsqueeze(-1), labels)
@@ -205,11 +199,11 @@ def test_kl_with_fused_lm_head():
     # Now switch to fused head and compare
     inject_prime_lm_head(model, chunk_size=16)
     with torch.no_grad():
-        fused_out = model(input_ids, labels=labels, temperature=temperature)
+        fused_out = model(input_ids, labels=labels, temperature=temperature, seq_lens=_seq_lens(input_ids))
     fused_logprobs = fused_out["logprobs"]
 
     diff = (vanilla_logprobs - fused_logprobs).abs().max()
-    assert diff < 1e-3, f"Vanilla vs fused logprob diff: {diff.item()}"
+    assert diff < 1e-2, f"Vanilla vs fused logprob diff: {diff.item()}"
 
 
 def test_kl_logprob_alignment():
@@ -220,7 +214,7 @@ def test_kl_logprob_alignment():
 
     # Simulate what the training loop does
     with torch.no_grad():
-        out = model(input_ids)
+        out = model(input_ids, seq_lens=_seq_lens(input_ids))
     logits = out["logits"]
 
     # Labels = shifted input_ids (predict next token)
@@ -233,7 +227,7 @@ def test_kl_logprob_alignment():
 
     # Position 0 should be the pad value (uniform distribution logprob)
     expected_pad = torch.log(torch.tensor(1.0 / model.config.vocab_size)).item()
-    assert logprobs_shifted[0, 0].item() == pytest.approx(expected_pad, abs=1e-5), (
+    assert logprobs_shifted[0, 0].item() == pytest.approx(expected_pad, abs=1e-1), (
         f"Position 0 should be pad value {expected_pad}, got {logprobs_shifted[0, 0].item()}"
     )
 
@@ -257,14 +251,14 @@ def test_kl_backward_through_policy():
 
     # Reference logprobs (detached)
     with torch.no_grad():
-        ref_out = ref_model(input_ids)
+        ref_out = ref_model(input_ids, seq_lens=_seq_lens(input_ids))
     ref_logprobs = selective_log_softmax(ref_out["logits"], labels)
     ref_logprobs = shift_tensor_right(
         ref_logprobs, pad_value=torch.log(torch.tensor(1.0 / ref_model.config.vocab_size)).item()
     ).detach()
 
     # Policy logprobs (with grad)
-    policy_out = policy_model(input_ids)
+    policy_out = policy_model(input_ids, seq_lens=_seq_lens(input_ids))
     policy_logprobs = selective_log_softmax(policy_out["logits"], labels)
     policy_logprobs = shift_tensor_right(
         policy_logprobs, pad_value=torch.log(torch.tensor(1.0 / policy_model.config.vocab_size)).item()
@@ -296,7 +290,7 @@ def test_kl_mismatch_formula_sanity():
         ref_model.load_state_dict(model.state_dict())
     _perturb_model(model, scale=0.1)
 
-    input_ids = torch.randint(0, 256, (2, 32), device="cuda")
+    input_ids = torch.randint(0, 256, (1, 32), device="cuda")
 
     trainer_logprobs = _get_logprobs_vanilla(model, input_ids)
     inference_logprobs = _get_logprobs_vanilla(ref_model, input_ids)

@@ -1,8 +1,6 @@
 # Kubernetes Deployment with Helm
 
-This directory contains a Helm chart for deploying PRIME-RL training infrastructure on Kubernetes clusters.
-
-For complete documentation, see the [Kubernetes guide](https://docs.primeintellect.ai/prime-rl/kubernetes).
+This directory contains a Helm chart for deploying prime-rl training infrastructure on Kubernetes clusters.
 
 ## Quick Start
 
@@ -15,7 +13,7 @@ kubectl get pods -l app.kubernetes.io/instance=my-exp
 
 # Exec into trainer and run training
 kubectl exec -it my-exp-trainer-0 -- bash
-cd /data && uv run trainer @ /app/examples/reverse_text/configs/train.toml
+cd /data && uv run trainer @ /app/k8s/prime-rl/examples/reverse-text/train.toml
 ```
 
 ## Prerequisites
@@ -32,7 +30,8 @@ prime-rl/
 ├── Chart.yaml
 ├── values.yaml           # Default configuration
 ├── examples/
-│   └── reverse-text.yaml # Example values for reverse-text
+│   ├── reverse-text.yaml # Example values for reverse-text
+│   └── reverse-text/     # Split orchestrator/inference/trainer configs the example runs
 └── templates/
     ├── deployment.yaml   # StatefulSets for orchestrator, inference, trainer
     ├── service.yaml      # Headless services for pod discovery
@@ -63,11 +62,11 @@ helm install my-exp ./prime-rl \
 
 ```bash
 helm uninstall my-exp
-kubectl delete pvc prime-rl-shared-data  # Warning: deletes data!
+
+# The PVC is named <release-name>-shared-data (see templates/pvc.yaml)
+kubectl delete pvc my-exp-shared-data  # Warning: deletes data!
 ```
 
 ## Learn More
 
-- [Full Kubernetes documentation](https://docs.primeintellect.ai/prime-rl/kubernetes) - Architecture, configuration, distributed training
-- [Deployment guide](https://docs.primeintellect.ai/prime-rl/deployment) - Non-Kubernetes deployments
-- [Troubleshooting](https://docs.primeintellect.ai/prime-rl/troubleshooting) - Common issues
+- [Scaling guide](https://docs.primeintellect.ai/prime-rl/scaling) - Non-Kubernetes multi-node deployment (SLURM), parallelism, benchmarking

@@ -1,5 +1,3 @@
-import warnings
-
 from transformers.configuration_utils import PretrainedConfig
 
 
@@ -10,6 +8,10 @@ def _index_cache_skip_topk(config, layer_idx: int) -> bool:
     index_topk_pattern = getattr(config, "index_topk_pattern", None)
     if index_topk_pattern is not None:
         return layer_idx < len(index_topk_pattern) and index_topk_pattern[layer_idx] == "S"
+
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is not None:
+        return layer_idx < len(indexer_types) and indexer_types[layer_idx] == "shared"
 
     return layer_idx % getattr(config, "index_topk_freq", 1) != 0
 
@@ -52,10 +54,6 @@ class GlmMoeDsaConfig(PretrainedConfig):
             Dimension of value heads.
         qk_nope_head_dim (`int`, defaults to 192):
             Dimension of query/key heads that don't use rotary position embeddings.
-        n_group (`int`, defaults to 1):
-            Number of groups for routed experts.
-        topk_group (`int`, defaults to 1):
-            Number of selected groups per token.
         num_experts_per_tok (`int`, defaults to 8):
             Number of active experts per token.
         first_k_dense_replace (`int`, defaults to 3):
@@ -97,8 +95,6 @@ class GlmMoeDsaConfig(PretrainedConfig):
             field is absent from the config).
         topk_method (`str`, defaults to `"noaux_tc"`):
             MoE routing top-k method used by GLM-5 checkpoints.
-        use_grouped_mm (`bool`, defaults to `True`):
-            Whether to use grouped matrix multiplication for MoE.
     """
 
     model_type = "glm_moe_dsa"
@@ -107,9 +103,9 @@ class GlmMoeDsaConfig(PretrainedConfig):
 
     base_model_tp_plan = {
         "layers.*.self_attn.o_proj": "rowwise",
-        "layers.*.mlp.experts.*.gate_proj": "colwise",
-        "layers.*.mlp.experts.*.up_proj": "colwise",
-        "layers.*.mlp.experts.*.down_proj": "rowwise",
+        "layers.*.mlp.experts.gate_proj": "colwise",
+        "layers.*.mlp.experts.up_proj": "colwise",
+        "layers.*.mlp.experts.down_proj": "rowwise",
         "layers.*.mlp.gate_proj": "colwise",
         "layers.*.mlp.up_proj": "colwise",
         "layers.*.mlp.down_proj": "rowwise",
@@ -137,8 +133,6 @@ class GlmMoeDsaConfig(PretrainedConfig):
         qk_rope_head_dim=64,
         v_head_dim=256,
         qk_nope_head_dim=192,
-        n_group=1,
-        topk_group=1,
         num_experts_per_tok=8,
         first_k_dense_replace=3,
         norm_topk_prob=True,
@@ -162,9 +156,9 @@ class GlmMoeDsaConfig(PretrainedConfig):
         use_index_cache=False,
         index_topk_freq=1,
         index_topk_pattern=None,
+        indexer_types=None,
         scoring_func="sigmoid",
         topk_method="noaux_tc",
-        use_grouped_mm=True,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -189,8 +183,6 @@ class GlmMoeDsaConfig(PretrainedConfig):
         self.n_shared_experts = n_shared_experts
         self.n_routed_experts = n_routed_experts
         self.routed_scaling_factor = routed_scaling_factor
-        self.n_group = n_group
-        self.topk_group = topk_group
         self.num_experts_per_tok = num_experts_per_tok
         self.first_k_dense_replace = first_k_dense_replace
         self.norm_topk_prob = norm_topk_prob
@@ -218,14 +210,15 @@ class GlmMoeDsaConfig(PretrainedConfig):
         self.use_index_cache = use_index_cache
         self.index_topk_freq = index_topk_freq
         self.index_topk_pattern = index_topk_pattern
+        self.indexer_types = indexer_types
         self.scoring_func = scoring_func
         self.topk_method = topk_method
-        self.use_grouped_mm = use_grouped_mm
         self.pad_token_id = pad_token_id
 
-        if not self.use_grouped_mm:
-            warnings.warn("not using grouped mm for moe is very slow, should only be used for debugging")
-
+        # head_dim is derived from qk_rope_head_dim (the RoPE slice). Some checkpoints (e.g. GLM-5.2)
+        # set head_dim=qk_nope_head_dim in config.json; drop it so PretrainedConfig.__init__ can't
+        # overwrite self.head_dim and break the rotary embedding dimension.
+        kwargs.pop("head_dim", None)
         super().__init__(
             pad_token_id=pad_token_id,
             tie_word_embeddings=tie_word_embeddings,

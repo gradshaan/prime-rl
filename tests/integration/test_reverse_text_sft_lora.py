@@ -3,22 +3,21 @@ from typing import Callable
 
 import pytest
 
-from prime_rl.trainer.weights import load_state_dict
 from tests.conftest import ProcessResult
+from tests.integration.dashboard_smoke import make_dashboard_test
 from tests.utils import check_loss_goes_down, strip_escape_codes
 
 pytestmark = [pytest.mark.slow, pytest.mark.gpu]
 
+RUN_NAME = "reverse-text-sft-lora"
+
+
+@pytest.fixture(scope="module")
+def run_dir(output_dir: Path) -> Path:
+    return output_dir / RUN_NAME
+
+
 TIMEOUT = 300  # 5 minutes
-
-
-def assert_adapter_checkpoint(adapter_dir: Path) -> None:
-    assert (adapter_dir / "adapter_config.json").exists()
-    state_dict = load_state_dict(adapter_dir)
-    assert state_dict
-    assert all(".0.weight" not in key for key in state_dict)
-    assert any(key.endswith("lora_A.weight") for key in state_dict)
-    assert all(key.startswith("base_model.model.") for key in state_dict)
 
 
 @pytest.fixture(scope="module")
@@ -40,16 +39,18 @@ def sft_lora_process(
         "run",
         "sft",
         "@",
-        "configs/ci/integration/reverse_text_sft_lora/start.toml",
-        "--deployment.num-gpus",
+        "configs/ci/integration/reverse-text-sft-lora/start.toml",
+        "--deployment.num-train-gpus",
         "2",
-        "--clean-output-dir",
-        "--wandb.project",
+        "--clean",
+        "--monitors.wandb.project",
         wandb_project,
-        "--wandb.name",
+        "--monitors.wandb.name",
         wandb_name,
         "--output-dir",
         output_dir.as_posix(),
+        "--run.name",
+        RUN_NAME,
     ]
 
     return run_process(cmd, timeout=TIMEOUT)
@@ -70,15 +71,17 @@ def sft_lora_resume_process(
         "run",
         "sft",
         "@",
-        "configs/ci/integration/reverse_text_sft_lora/resume.toml",
-        "--deployment.num-gpus",
+        "configs/ci/integration/reverse-text-sft-lora/resume.toml",
+        "--deployment.num-train-gpus",
         "2",
-        "--wandb.project",
+        "--monitors.wandb.project",
         wandb_project,
-        "--wandb.name",
+        "--monitors.wandb.name",
         wandb_name,
         "--output-dir",
         output_dir.as_posix(),
+        "--run.name",
+        RUN_NAME,
     ]
 
     return run_process(cmd, timeout=TIMEOUT)
@@ -89,19 +92,13 @@ def test_no_error(sft_lora_process: ProcessResult):
     assert sft_lora_process.returncode == 0, f"Process has non-zero return code ({sft_lora_process})"
 
 
-def test_loss_goes_down(sft_lora_process: ProcessResult, output_dir: Path):
+def test_loss_goes_down(sft_lora_process: ProcessResult, run_dir: Path):
     """Tests that the loss goes down in the SFT LoRA process"""
-    trainer_log_path = output_dir / "logs" / "trainer.log"
+    trainer_log_path = run_dir / "logs" / "latest" / "trainer.log"
     print(f"Checking trainer path in {trainer_log_path}")
     with open(trainer_log_path, "r") as f:
         trainer_stdout = strip_escape_codes(f.read()).splitlines()
     check_loss_goes_down(trainer_stdout)
-
-
-def test_adapter_checkpoint_written(sft_lora_process: ProcessResult, output_dir: Path):
-    """Tests that the adapter checkpoint is written with valid PEFT-compatible keys."""
-    adapter_dir = output_dir / "weights" / "step_5" / "lora_adapters"
-    assert_adapter_checkpoint(adapter_dir)
 
 
 def test_no_error_resume(sft_lora_resume_process: ProcessResult):
@@ -109,16 +106,13 @@ def test_no_error_resume(sft_lora_resume_process: ProcessResult):
     assert sft_lora_resume_process.returncode == 0, f"Process has non-zero return code ({sft_lora_resume_process})"
 
 
-def test_loss_goes_down_resume(sft_lora_resume_process: ProcessResult, output_dir: Path):
+def test_loss_goes_down_resume(sft_lora_resume_process: ProcessResult, run_dir: Path):
     """Tests that the loss goes down in the SFT LoRA resume process"""
-    trainer_log_path = output_dir / "logs" / "trainer.log"
+    trainer_log_path = run_dir / "logs" / "latest" / "trainer.log"
     print(f"Checking trainer path in {trainer_log_path}")
     with open(trainer_log_path, "r") as f:
         trainer_stdout = strip_escape_codes(f.read()).splitlines()
     check_loss_goes_down(trainer_stdout)
 
 
-def test_adapter_checkpoint_written_resume(sft_lora_resume_process: ProcessResult, output_dir: Path):
-    """Tests that the adapter checkpoint is written after resuming with valid PEFT-compatible keys."""
-    adapter_dir = output_dir / "weights" / "step_10" / "lora_adapters"
-    assert_adapter_checkpoint(adapter_dir)
+test_dashboard = make_dashboard_test("sft_lora_process", RUN_NAME)

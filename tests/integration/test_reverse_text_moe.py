@@ -8,6 +8,14 @@ from tests.utils import check_no_error
 
 pytestmark = [pytest.mark.gpu, pytest.mark.slow]
 
+RUN_NAME = "reverse-text-moe"
+
+
+@pytest.fixture(scope="module")
+def run_dir(output_dir: Path) -> Path:
+    return output_dir / RUN_NAME
+
+
 TIMEOUT = 900  # 15 minutes
 
 
@@ -28,22 +36,27 @@ def rl_process(
         "run",
         "rl",
         "@",
-        "configs/ci/integration/reverse_text_moe/start.toml",
+        "configs/ci/integration/reverse-text-moe/start.toml",
+        "--clean",
         "--trainer.model.impl",
         "custom",
-        "--wandb.project",
+        "--trainer.model.conversion-dir",
+        (output_dir / RUN_NAME / "model-conversion").as_posix(),
+        "--monitors.wandb.project",
         wandb_project,
-        "--wandb.name",
+        "--monitors.wandb.name",
         f"{wandb_name}-custom",
         "--output-dir",
         output_dir.as_posix(),
+        "--run.name",
+        RUN_NAME,
     ]
     return run_process(cmd, timeout=TIMEOUT)
 
 
 @pytest.fixture(scope="module")
-def test_no_error(rl_process: ProcessResult, output_dir: Path):
-    check_no_error(rl_process, output_dir)
+def test_no_error(rl_process: ProcessResult, run_dir: Path):
+    check_no_error(rl_process, run_dir)
 
 
 def test_moe_runs(rl_process: ProcessResult, test_no_error):

@@ -14,16 +14,10 @@ from transformers.utils.deprecation import deprecate_kwarg
 
 from prime_rl.trainer.models.base import PreTrainedModelPrimeRL
 from prime_rl.trainer.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig, _index_cache_skip_topk
-from prime_rl.trainer.models.glm_moe_dsa.converting_glm_moe_dsa import (
-    convert_hf_layer_to_tt,
-    convert_hf_to_tt_moe,
-    convert_tt_layer_to_hf,
-    convert_tt_layer_to_vllm_kernel,
-    convert_tt_to_hf_moe,
-)
+from prime_rl.trainer.models.glm_moe_dsa.converting_glm_moe_dsa import conversion_chain
 from prime_rl.trainer.models.glm_moe_dsa.sparse_mla_attention import GlmMoeDsaAttention, SparseMlaAttentionArgs
 from prime_rl.trainer.models.layers.lm_head import PrimeLmOutput
-from prime_rl.trainer.models.layers.mlp import MLP, MLPConfig
+from prime_rl.trainer.models.layers.mlp import FeedForward
 from prime_rl.trainer.models.layers.moe import MoE, MoEArgs
 from prime_rl.trainer.models.layers.norms import RMSNorm, RMSNormConfig
 from prime_rl.trainer.models.layers.rotary_emb import RotaryEmbedding, RotaryEmbeddingConfig
@@ -59,36 +53,39 @@ class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
 
         moe_args = MoEArgs(
             num_experts=config.n_routed_experts,
-            num_shared_experts=config.n_shared_experts,
+            expert_type="gated",
+            activation=config.hidden_act,
             score_func="sigmoid",
             route_norm=config.norm_topk_prob,
             route_scale=config.routed_scaling_factor,
             score_before_experts=False,
             top_k=config.num_experts_per_tok,
             load_balance_coeff=1e-3,
-            use_grouped_mm=config.use_grouped_mm,
-            fp8=getattr(config, "fp8", False),
         )
-        mlp_config = MLPConfig(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            gate_act=config.hidden_act,
-            bias=False,
-        )
-
         if layer_idx >= config.first_k_dense_replace:
-            self.mlp = MoE(moe_args, dim=config.hidden_size, hidden_dim=config.moe_intermediate_size)
+            shared_expert = None
+            if config.n_shared_experts > 0:
+                shared_expert = FeedForward(
+                    dim=config.hidden_size,
+                    hidden_dim=config.moe_intermediate_size * config.n_shared_experts,
+                    expert_type=moe_args.expert_type,
+                    activation=moe_args.activation,
+                )
+            self.mlp = MoE.from_args(
+                moe_args,
+                dim=config.hidden_size,
+                hidden_dim=config.moe_intermediate_size,
+                shared_expert=shared_expert,
+            )
         else:
-            self.mlp = MLP(mlp_config)
+            self.mlp = FeedForward(
+                dim=config.hidden_size,
+                hidden_dim=config.intermediate_size,
+                activation=config.hidden_act,
+            )
 
         self.input_layernorm = RMSNorm(RMSNormConfig(hidden_size=config.hidden_size, eps=config.rms_norm_eps))
         self.post_attention_layernorm = RMSNorm(RMSNormConfig(hidden_size=config.hidden_size, eps=config.rms_norm_eps))
-
-    def set_context_parallel_attributes(self, cp_group: dist.ProcessGroup, cp_rank: int, cp_world_size: int) -> None:
-        self._cp_group = cp_group
-        self._cp_rank = cp_rank
-        self._cp_world_size = cp_world_size
-        self.self_attn.set_context_parallel_attributes(cp_group, cp_rank, cp_world_size)
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
@@ -126,7 +123,7 @@ class GlmMoeDsaPreTrainedModel(PreTrainedModelPrimeRL):
     _no_split_modules = ["GlmMoeDsaDecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn = True
-    _supports_sdpa = True
+    _supports_sdpa = False
     _supports_flex_attn = True
     _can_compile_fullgraph = False
     _supports_attention_backend = True
@@ -138,38 +135,20 @@ class GlmMoeDsaPreTrainedModel(PreTrainedModelPrimeRL):
         super()._init_weights(module)
 
     @classmethod
+    def keep_in_fp32_for_weight_transfer(cls, name: str) -> bool:
+        return name.endswith("mlp.router.selection_bias")
+
+    @classmethod
     def is_hf_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
         return any("mlp.experts.1.up_proj" in name or "mlp.experts.gate_up_proj" in name for name in state_dict.keys())
 
     @classmethod
     def is_prime_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
-        return any("mlp.experts.w1" in module_name for module_name in state_dict.keys())
+        return any("mlp.experts.gate_proj" in module_name for module_name in state_dict.keys())
 
     @classmethod
-    def convert_to_hf(cls, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
-        convert_tt_to_hf_moe(state_dict)
-        return state_dict
-
-    @classmethod
-    def convert_to_prime(cls, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
-        convert_hf_to_tt_moe(state_dict)
-        return state_dict
-
-    @classmethod
-    def convert_layer_to_hf(cls, state_dict: dict[str, Tensor], layer_idx: int) -> dict[str, Tensor]:
-        convert_tt_layer_to_hf(state_dict, layer_idx)
-        return state_dict
-
-    @classmethod
-    def convert_layer_to_prime(cls, state_dict: dict[str, Tensor], layer_idx: int) -> dict[str, Tensor]:
-        convert_hf_layer_to_tt(state_dict, layer_idx)
-        return state_dict
-
-    @classmethod
-    def convert_layer_to_vllm_kernel(
-        cls, state_dict: dict[str, Tensor], layer_idx: int, quantize_fp8: bool = False
-    ) -> dict[str, Tensor]:
-        return convert_tt_layer_to_vllm_kernel(state_dict, layer_idx, quantize_fp8=quantize_fp8)
+    def conversion_chain(cls, config):
+        return conversion_chain(config)
 
 
 @auto_docstring
@@ -198,13 +177,6 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
 
         self.post_init()
 
-    def _context_parallel_state(self) -> tuple[dist.ProcessGroup | None, int, int]:
-        if len(self.layers) == 0:
-            return None, 0, 1
-
-        layer = self.layers[0]
-        return getattr(layer, "_cp_group", None), getattr(layer, "_cp_rank", 0), getattr(layer, "_cp_world_size", 1)
-
     def _gather_position_ids_for_cp(
         self,
         position_ids: torch.LongTensor,
@@ -222,10 +194,17 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         routed_experts: Optional[torch.LongTensor] = None,
+        *,
+        seq_lens: Optional[torch.LongTensor] = None,
+        seq_lens_are_pre_shard: bool = False,
     ) -> BaseModelOutputWithPast:
         """
         routed_experts (`torch.LongTensor` of shape `(batch_size, sequence_length, num_hidden_layers, num_experts_per_tok)`, *optional*):
             Routed experts for each token in the sequence. Only used for router replay.
+        seq_lens (`torch.LongTensor` of shape `(num_documents,)`, *optional*):
+            Per-document lengths of the packed row (PrimeRL packed-batch contract). Unused.
+        seq_lens_are_pre_shard (`bool`, *optional*, defaults to `False`):
+            Whether `seq_lens` holds pre-CP-shard (global) document boundaries. Unused.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -233,9 +212,9 @@ class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
 
-        cp_group, cp_rank, cp_world_size = self._context_parallel_state()
-        if cp_group is not None and cp_world_size > 1:
-            position_ids_full = self._gather_position_ids_for_cp(position_ids, cp_group, cp_world_size)
+        cp_rank, cp_world_size = self.cp_context.cp_rank, self.cp_context.cp_world_size
+        if self.cp_context.cp_enabled:
+            position_ids_full = self._gather_position_ids_for_cp(position_ids, self.cp_context.cp_group, cp_world_size)
         else:
             position_ids_full = position_ids
 
@@ -308,9 +287,19 @@ class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         temperature: Optional[torch.Tensor] = None,
         routed_experts: Optional[torch.LongTensor] = None,
+        # Document boundaries derive from position_ids (sparse MLA builds its
+        # varlen indices from them); seq_lens is accepted to satisfy the
+        # trainer's universal contract.
+        *,
+        seq_lens: torch.LongTensor,
+        seq_lens_are_pre_shard: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> PrimeLmOutput:
         r"""
+        seq_lens (`torch.LongTensor` of shape `(num_documents,)`):
+            Per-document lengths of the packed row (PrimeRL packed-batch contract).
+        seq_lens_are_pre_shard (`bool`, *optional*, defaults to `False`):
+            Whether `seq_lens` holds pre-CP-shard (global) document boundaries.
         cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
             Indices of input tokens in the KV cache. Accepted only for HuggingFace API
             compatibility — prime-rl asserts `use_cache is None` since training does not

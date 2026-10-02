@@ -21,12 +21,13 @@ class LagunaConfig(PretrainedConfig):
         "layers.*.mlp.gate_proj": "colwise",
         "layers.*.mlp.up_proj": "colwise",
         "layers.*.mlp.down_proj": "rowwise",
-        "layers.*.mlp.experts.gate_up_proj": "packed_colwise",
+        "layers.*.mlp.experts.gate_proj": "colwise",
+        "layers.*.mlp.experts.up_proj": "colwise",
         "layers.*.mlp.experts.down_proj": "rowwise",
         "layers.*.mlp.experts": "moe_tp_experts",
-        "layers.*.shared_expert.w1": "colwise",
-        "layers.*.shared_expert.w2": "rowwise",
-        "layers.*.shared_expert.w3": "colwise",
+        "layers.*.mlp.shared_expert.gate_proj": "colwise",
+        "layers.*.mlp.shared_expert.up_proj": "colwise",
+        "layers.*.mlp.shared_expert.down_proj": "rowwise",
     }
     base_model_pp_plan = {
         "embed_tokens": (["input_ids"], ["inputs_embeds"]),
@@ -64,6 +65,7 @@ class LagunaConfig(PretrainedConfig):
         eos_token_id: int | list[int] | None = None,
         head_dim: int = 128,
         attention_bias: bool = False,
+        gating: bool | str = True,
         partial_rotary_factor: float | None = None,
         num_attention_heads_per_layer: list[int] | None = None,
         mlp_layer_types: list[str] | None = None,
@@ -71,7 +73,6 @@ class LagunaConfig(PretrainedConfig):
         moe_apply_router_weight_on_input: bool = False,
         moe_router_logit_softcapping: float = 0.0,
         load_balance_coeff: float | None = 1e-3,
-        use_grouped_mm: bool = True,
         **kwargs,
     ):
         raw_rope_parameters = rope_parameters if rope_parameters is not None else rope_scaling
@@ -98,6 +99,7 @@ class LagunaConfig(PretrainedConfig):
         self.layer_types = layer_types or ["full_attention"] * num_hidden_layers
         self.head_dim = head_dim
         self.attention_bias = attention_bias
+        self.gating = gating
         self.partial_rotary_factor = partial_rotary_factor
         self.num_attention_heads_per_layer = num_attention_heads_per_layer or [num_attention_heads] * num_hidden_layers
         self.mlp_layer_types = mlp_layer_types or ["dense"] + ["sparse"] * (num_hidden_layers - 1)
@@ -105,7 +107,6 @@ class LagunaConfig(PretrainedConfig):
         self.moe_apply_router_weight_on_input = moe_apply_router_weight_on_input
         self.moe_router_logit_softcapping = moe_router_logit_softcapping
         self.load_balance_coeff = load_balance_coeff
-        self.use_grouped_mm = use_grouped_mm
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -147,6 +148,9 @@ class LagunaConfig(PretrainedConfig):
 
         for params in nested.values():
             params.setdefault("rope_type", "default")
+
+        # vLLM ignores this override and derives YaRN scaling from factor; match it for rollout/trainer parity.
+        nested["full_attention"].pop("attention_factor", None)
 
         self.rope_parameters = nested
         self.partial_rotary_factor = None

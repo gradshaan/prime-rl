@@ -1,6 +1,6 @@
 # Scaling
 
-This page covers how to scale `prime-rl` from a single GPU to a 1000-GPU cluster: single-node and multi-node deployments, FSDP / expert parallelism / context parallelism, and throughput benchmarking. For knobs that fit on one box, see [Training](training.md) first. For prefill/decode disaggregated inference, see [Advanced](advanced.md#disaggregated-prefilldecode-inference).
+This page covers how to scale `prime-rl` from a single GPU to a 1000-GPU cluster: single-node and multi-node deployments, FSDP / expert parallelism / context parallelism, and throughput benchmarking. See [Training](training.md) for detailed documentation of the trainer configuration and [Inference](inference.md) for the inference configuration.
 
 ## Table of Contents
 
@@ -38,24 +38,25 @@ The `rl`, `sft`, and `inference` entrypoints all accept a `[deployment]` block (
 uv run rl @ rl.toml \
   --deployment.num-infer-gpus 6 \
   --deployment.num-train-gpus 2 \
-  --inference.parallel.dp 6
+  --inference.vllm.data-parallel-size 6
 ```
 
-The launcher allocates GPUs in order from `CUDA_VISIBLE_DEVICES` (or all visible GPUs): inference first, trainer next, teacher last. To target a specific physical subset, pin `CUDA_VISIBLE_DEVICES` before launching.
+The launcher allocates GPUs in order from `CUDA_VISIBLE_DEVICES` (or all visible GPUs): inference first, trainer next. To target a specific physical subset, pin `CUDA_VISIBLE_DEVICES` before launching.
 
-For quick A/B ablations on the same node, run two RL instances side-by-side in separate tmux sessions, each pinned to half the GPUs and a separate inference port:
+For quick A/B ablations on the same node, run two RL instances side-by-side in separate shells, each pinned to half the GPUs and a separate inference port, and track both in one dashboard:
 
 ```bash
-# session 1, GPUs 0–1, default port 8000
-bash scripts/tmux.sh -s exp1 -o outputs/exp1
-CUDA_VISIBLE_DEVICES=0,1 uv run rl @ rl.toml --output-dir outputs/exp1
+# shell 1, GPUs 0–1, default port 8000
+CUDA_VISIBLE_DEVICES=0,1 uv run rl @ rl.toml --run.name exp1
 
-# session 2, GPUs 2–3, port 8001
-bash scripts/tmux.sh -s exp2 -o outputs/exp2
+# shell 2, GPUs 2–3, port 8001
 CUDA_VISIBLE_DEVICES=2,3 uv run rl @ rl.toml \
   --inference.server.port 8001 \
-  --orchestrator.client.base-url http://localhost:8001/v1 \
-  --output-dir outputs/exp2
+  --orchestrator.model.client.base-url http://localhost:8001/v1 \
+  --run.name exp2
+
+# watch both side by side
+uv run dashboard outputs
 ```
 
 #### SFT and Torchrun
@@ -69,7 +70,7 @@ uv run torchrun \
   src/prime_rl/trainer/sft/train.py @ sft.toml
 ```
 
-`--local-ranks-filter 0` keeps console output to rank 0 only; per-rank stdout/stderr is still captured in `<output_dir>/logs/trainer/torchrun/`.
+`--local-ranks-filter 0` keeps console output to rank 0 only; per-rank stdout/stderr is still captured in `<run_dir>/logs/latest/trainer/torchrun/`.
 
 ### Multi-Node
 
@@ -86,31 +87,39 @@ FSDP2 is the default model sharding strategy. By default the trainer fully shard
 | `trainer.model.dp_replicate` | Number of dimensions to **replicate** instead of shard. Set to 2 to run 2-way DP replication × FSDP sharding within each replica — useful for very large clusters where pure FSDP communication dominates. |
 | `trainer.model.reshard_after_forward` | If `true` (default), parameters are resharded after the forward pass to free memory; the backward pass re-gathers. Set `false` to keep params resident — faster but more memory. |
 | `trainer.model.fsdp_cpu_offload` | Offload params + grads + optimizer state to CPU. Big memory win, large throughput hit. |
-| `trainer.model.optim_cpu_offload` | Offload only optimizer state. Mid-ground — small throughput cost, decent memory savings, especially at low GPU count. |
+| `trainer.model.optim_cpu_offload` | Offload optimizer state to CPU between steps. Enabled by default. |
+| `trainer.model.full_offload` | Offload gradients, FP32 masters, and optimizer state and run the optimizer (AdamW or SignSGD) on CPU during backward. Disabled by default. |
 
 ### Expert Parallelism
 
-EP shards MoE expert weights across the EP mesh, dramatically reducing the FSDP communication volume per layer. EP is only available with the custom model implementation (`model.impl = "custom"` or `"auto"` for supported families).
+EP shards MoE expert weights across the EP mesh, dramatically reducing the FSDP communication volume per layer and improving the training throughput. EP is only available with the custom model implementation (`model.impl = "custom"` or `"auto"` for supported families).
+
+`ep` defaults to `"auto"`, which resolves at startup to the largest valid EP degree up to 8. It loads the model config to read `num_experts`, then picks the biggest divisor of `num_experts` that also divides the FSDP island size (`world_size // dp_replicate`), is a multiple of `cp`, and is at most 8. For non-MoE models, resolves to 1 (no-op). Set `ep` to an explicit integer to override:
 
 ```toml
 [trainer.model]
 impl = "custom"
-ep = 8                     # EP degree; must divide num_experts
-ep_comm_backend = "torch"  # or "deepep"
+ep = 8  # explicit EP degree; must divide num_experts
+
+[trainer.model.moe.dispatch]
+type = "torch"
+transport = "bf16"
 ```
 
-`ep_comm_backend = "deepep"` uses DeepEP's custom dispatch/combine kernels for speed, with two extra knobs (`deepep_num_sms`, `deepep_token_chunk_size`) — tune on your hardware.
+For DeepEP, set `type = "deepep"` and tune `num_sms` plus optional `token_chunk_size` in the same dispatch table. Routed-expert precision is selected separately with `[trainer.model.moe.compute]` (`bf16`, `deepgemm_fp8`, or `mxfp8`).
 
 ### Context Parallelism
 
-CP shards a single sequence across multiple GPUs along the token dimension — for long-context sequences. Only available with the custom impl and flash-attention.
+CP shards a single sequence across multiple GPUs along the token dimension — for long-context sequences. Prefer `ulysses`: it gets the most throughput and is the only style that works for hybrid linear-attention/Mamba models (Qwen3.5, NemotronH) and for VLMs. Each model class declares its supported styles in `cp_support`; an unsupported `cp_style`, or a model with no CP support at all, is rejected at setup.
+
+`ulysses` head-shards Q/K/V, so the CP degree must divide `num_attention_heads`. GQA models with fewer KV heads than the CP degree (e.g. NemotronH: 32 query heads, 2 KV heads) are supported via KV-head replication; the CP degree must then be a multiple of `num_key_value_heads`. Nemotron-H redistributes its Mamba activations between sequence- and head-parallel layouts in the model-owned Mamba path; the CP degree must divide `mamba_num_heads` and `n_groups`.
 
 ```toml
 [trainer.model]
 impl = "custom"
-attn = "flash_attention_2"   # or fa3 / fa4
+attn = "auto"                # auto = FA3 on Hopper, FA4 on datacenter Blackwell, FA2 otherwise; or flash_attention_2/3/4
 cp = 2                       # CP degree
-cp_style = "ring"            # "ulysses" for non-FA kernels
+cp_style = "ulysses"         # "ring"
 ```
 
 ### Activation Checkpointing and Offloading
@@ -121,56 +130,44 @@ cp_style = "ring"            # "ulysses" for non-FA kernels
 | `trainer.model.ac.mode = "selective"` | medium | small | 
 | `trainer.model.ac_offloading` | extra | a bit more |
 
-Enable selective AC (custom impl only) for the best memory/throughput tradeoff:
+AC and AC offloading are enabled by default (full mode). Both AC modes retain stateful MoE routing updates and DeepEP communication that cannot safely replay. Selective AC uses the same transformer-block boundaries and additionally retains distributed communication, expensive matrix multiplications, grouped GEMMs, and supported attention kernels:
 
 ```toml
 [trainer.model.ac]
 mode = "selective"
-targets = ["norm", "attn_proj"]  # see Reference for the full list per architecture
 ```
+
+Set `targets` to operator names (for example, `"aten::mm"`) or namespaces (for example, `"prime_rl_collectives"`) to replace the default selective targets. Correctness-required operations remain retained.
+
+Activation offloading still applies to tensors saved by autograd, but tensors retained by the checkpoint policy remain on the accelerator.
+
+`ac_offloading` is also on by default with `max_inflight_activations = 5`. We've observed this feature to be very effective, lowering the peak memory usage by 30-40% in some cases, while only losing ~3-5% of throughput. To disable either, set `model.ac = "None"` or `model.ac_offloading = "None"`.
 
 ### Optimizer Offloading
 
-Offloading optimizer states to CPU is a near-free memory win at low GPU counts:
-
-```toml
-[trainer.optim]
-# any optimizer type
-type = "adamw"
-
-[trainer.model]
-optim_cpu_offload = true
-```
-
-Mutually exclusive with `fsdp_cpu_offload`. Also incompatible with `trainer.max_concurrent_runs > 1` (multi-tenant training). Muon doesn't support `fsdp_cpu_offload` but does support `optim_cpu_offload`.
+State-only optimizer offload remains enabled by default with `model.optim_cpu_offload = true`. For full offload, set `model.optim_cpu_offload = false` and `model.full_offload = true`; this keeps BF16 compute weights on GPU and runs CPU optimizer chunks as gradients become ready during backward. Full offload only supports AdamW and SignSGD (`optim.type = "sign_sgd"`) and disables gradient clipping. SignSGD is stateless, so it halves the host RAM footprint versus AdamW (8 instead of 16 bytes per parameter: FP32 master + FP32 accumulated gradient, no moments).
 
 ### LM Head Chunking
 
-The vanilla LM head materializes a `[batch * seq, vocab]` logits tensor on every step — a major memory tax when the vocabulary is large (often >100K). `fused_lm_head_token_chunk_size` swaps in a custom fused linear + logprob/entropy kernel that streams through `chunk_size` tokens at a time, avoiding the materialization:
+The vanilla LM head materializes a `[batch * seq, vocab]` logits tensor on every step — a major memory tax when the vocabulary is large (often >100K). `fused_lm_head_token_chunk_size` swaps in a custom fused linear + logprob/entropy kernel that streams through `chunk_size` tokens at a time, avoiding the materialization. It defaults to `1024` for RL training:
 
 ```toml
 [trainer.model]
-fused_lm_head_token_chunk_size = "auto"     # picks 8192 for RL
-# or explicit:
-# fused_lm_head_token_chunk_size = 1024     # smaller = lower memory, more launches
-# fused_lm_head_token_chunk_size = "disabled"  # default; vanilla LM head
+fused_lm_head_token_chunk_size = 1024       # default
+# fused_lm_head_token_chunk_size = "disabled"  # vanilla LM head
 ```
 
-`auto` is a safe starting point for RL. Drop the chunk size further when peak memory is still tight (e.g. with very long sequences); raise it to amortize kernel-launch overhead. Only available with `model.impl = "custom"`, and currently RL-only — the SFT trainer rejects integer values.
+Drop the chunk size further when peak memory is still tight (e.g. with very long sequences); raise it to amortize kernel-launch overhead. SFT training silently disables this (not supported yet). Only available with `model.impl = "custom"`.
 
 ## Memory-Tight Recipe
 
-The kitchen-sink config for fitting large MoE on limited GPUs at acceptable throughput:
+The kitchen-sink config for fitting large MoE on limited GPUs at acceptable throughput. AC, AC offloading, compile, fused LM head chunking, optimizer offload, and EP auto-resolution are on by default — only CP needs to be set explicitly (and EP overridden if auto-resolution is not desired):
 
 ```toml
 [trainer.model]
 impl = "custom"
-fused_lm_head_token_chunk_size = 1024
 ep = 8
 cp = 2
-optim_cpu_offload = true
-
-[trainer.model.compile]
 
 [trainer.model.ac]
 freq = 1
@@ -179,11 +176,13 @@ freq = 1
 max_inflight_activations = 1
 ```
 
-Walks through every memory lever in order: FSDP+EP shard the weights, CP shards the activations along the token dim, AC + AC offloading shrink the activation footprint, fused LM head chunks the loss, `torch.compile` reduces fragmentation, optim offload moves Adam state off GPU. Apply selectively — each knob has a throughput cost.
+The defaults already cover: fused LM head chunking (`1024`), `torch.compile` (fullgraph=False), AC (full mode), AC offloading (`max_inflight_activations=5`), and optimizer CPU offload. Walks through every memory lever in order: FSDP+EP shard the weights, CP shards the activations along the token dim, AC + AC offloading shrink the activation footprint, fused LM head chunks the loss, `torch.compile` reduces fragmentation, optim offload moves Adam state off GPU. Apply selectively — each knob has a throughput cost.
 
 ## SLURM
 
 The `rl`, `sft`, and `inference` entrypoints all submit to SLURM when a `[slurm]` table is present — there's no separate entrypoint.
+
+> **The prime-rl checkout and its `uv` venv must live on a shared filesystem** visible to every node. The generated sbatch script runs a single `uv sync --all-extras --all-packages` on the batch node (not once per node), so all ranks share that one environment — a node-local venv would leave the other nodes stale.
 
 ### Activation
 
@@ -201,8 +200,10 @@ Launch:
 
 ```bash
 uv run rl @ base_rl.toml @ my_slurm.toml             # submits via sbatch
-uv run rl @ base_rl.toml @ my_slurm.toml --dry-run   # writes the sbatch script + resolved config, exits
+uv run rl @ base_rl.toml @ my_slurm.toml --dry-run   # writes launcher/rl.sbatch + resolved config, exits
 ```
+
+Every SLURM entrypoint stores its generated scripts and coordination files under `<run_dir>/launcher/`. SLURM stdout and stderr go to `launcher/logs/`. Local launches do not create `launcher/`.
 
 ### `[deployment]` Block
 
@@ -212,7 +213,7 @@ uv run rl @ base_rl.toml @ my_slurm.toml --dry-run   # writes the sbatch script 
 [deployment]
 type = "multi_node"
 num_train_nodes = 2
-num_infer_nodes = 1
+num_infer_nodes = 1              # optional when inference.deployment defines the node topology
 gpus_per_node = 8                # default
 nodes_per_fsdp_group = 1         # optional — controls FSDP island size
 ```
@@ -222,18 +223,38 @@ SFT multi-node:
 ```toml
 [deployment]
 type = "multi_node"
-num_nodes = 2
+num_train_nodes = 2
+num_infer_nodes = 1  # required only for online evals
 gpus_per_node = 8
 ```
 
 ### Examples
 
-Full multi-node configs ship in [`examples/multinode/`](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/multinode):
+Full multi-node configs ship under [`examples/advanced/`](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/advanced):
 
-- [`rl.toml`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/examples/multinode/rl.toml) — two-node RL run with NCCL weight broadcast on a 30B MoE student.
-- [`sft.toml`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/examples/multinode/sft.toml) — two-node SFT against the same model.
+- [`nemotron-3-super/swe.toml`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/configs/advanced/nemotron-3-super/swe.toml) — 4 trainer + 1 inference node RL on a 120B hybrid-Mamba MoE with NCCL weight broadcast.
+- [`glm-5.3/`](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/advanced/glm-5.3) — large-scale and P/D-disaggregated inference across the GLM-5 family.
+- [`glm-4.5-air/swe-2-node.toml`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/examples/advanced/glm-4.5-air/swe-2-node.toml) — train a 100B+ MoE on only two nodes: a single-node sign-SGD trainer (full optimizer offload) paired with one inference replica at batch size 64. An overlay on the shared `swe-budget.toml` base — launch with `uv run rl @ swe-budget.toml @ swe-2-node.toml`.
 
-For inference-only multi-node, set `[deployment] type = "multi_node"` on an inference TOML — each node runs an independent vLLM replica (TP and DP must fit within one node), and the launcher prints one URL per node. Front the URLs with a router or point clients at any of them.
+For inference-only multi-node, set `[deployment] type = "multi_node"` on an inference TOML — each node runs an independent vLLM replica (TP and DP must fit within one node), fronted by a single global router on node 0. Point clients at the router URL the launcher prints.
+
+### NIXL weight broadcast
+
+Set `[weight_broadcast] type = "nixl"` to use receiver-driven NIXL weight transfer. Before the first SLURM run, install the NIXL/UCX build and the ModelExpress service binaries on the shared filesystem:
+
+```bash
+bash scripts/install_nixl_from_source.sh
+uv pip install --reinstall --no-deps deps/nixl_cu12-*.whl
+bash scripts/install_modelexpress.sh
+```
+
+The generated job starts a job-scoped ModelExpress server and Redis backend on the trainer head node and passes that address to every component. To use an existing service, set `slurm.launch_modelexpress = false` and configure `weight_broadcast.host` and `weight_broadcast.port`.
+
+The launcher requires the CUDA and InfiniBand transports from `third_party/ucx`. Each NIXL process selects the active InfiniBand port nearest its GPU; an explicitly configured `UCX_NET_DEVICES` takes precedence. Inference ranks start their pulls at different trainer ranks so concurrent workers distribute traffic across all available source rails.
+
+ModelExpress exchanges peer metadata during startup. Weight updates reuse prepared NIXL requests, post every trainer-rank read in a transfer group concurrently, and use versioned NIXL notifications for source readiness and buffer credits.
+
+By default, the trainer and inference worker each allocate one transfer arena. Set `weight_broadcast.overlap_transfer_and_replay = true` to allocate two arenas on both sides and replay one weight group while receiving the next. The additional arena is the size of the largest transfer group per GPU; allocation errors are reported instead of silently disabling overlap.
 
 ### Custom Templates
 
@@ -247,22 +268,14 @@ The default templates live under [`src/prime_rl/templates/`](https://github.com/
 
 ## Benchmarking
 
-Every entrypoint supports a `--bench` flag that runs a few warm-up + measurement steps with fake data and prints a rich-formatted throughput / MFU table:
+To benchmark a parallelism config before committing a multi-day run, run a short training with fake data and a step cap, and read throughput / MFU / step time / peak memory from the logs:
 
 ```bash
 # SFT trainer alone
-uv run sft @ sft.toml --bench
-uv run sft ... --data.type fake --data.length variable --bench   # variable-length fake data
+uv run sft @ sft.toml --data.type fake --max-steps 4
 
-# RL trainer alone (no inference involved)
-uv run trainer @ train.toml --data.fake --bench
-
-# Inference alone — start the server normally, then bench the orchestrator
-uv run inference @ infer.toml
-uv run orchestrator @ orch.toml --bench
-
-# Full RL stack (trainer with fake data, inference with real data from orchestrator)
-uv run rl @ rl.toml --bench
+# RL trainer alone (no inference involved) -- launch it under torchrun, like the `rl` launcher does
+uv run torchrun --nproc-per-node=8 src/prime_rl/trainer/rl/train.py @ train.toml --data.fake --max-steps 4
 ```
 
-Persist results with `--bench.output-json`. Use this to compare parallelism configs before committing a multi-day run.
+Every step logs `Throughput`, `MFU`, and `Peak Mem.` to the console. For machine-readable numbers, the file monitor writes `monitors/file/metrics.jsonl` under the run's output directory by default (`monitors.file`); aggregate `perf/throughput`, `perf/mfu`, `time/step`, and `perf/peak_memory` from the run's `metrics.jsonl` — skip the first step, it is warmup. [`benchmarks/scripts/run_single_benchmark.py`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/benchmarks/scripts/run_single_benchmark.py) does exactly this and is what the CI benchmark matrix runs.

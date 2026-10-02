@@ -4,292 +4,90 @@ import time
 from pathlib import Path
 from typing import cast
 
-# Disable transformers hub kernel interception by default. The `kernels` package, when installed,
-# causes transformers to auto-replace modules (e.g. mamba-ssm) with hub kernel versions that may
-# have incompatible CUDA requirements. We only enable it explicitly for models that need it (GPT-OSS).
+# Disable transformers hub kernel interception. Installed hub kernels can otherwise replace
+# modules with implementations that have incompatible CUDA requirements.
 os.environ.setdefault("USE_HUB_KERNELS", "NO")
 
 import torch
 import torch._dynamo
+import torch.distributed as dist
 import torch.nn as nn
 from huggingface_hub import snapshot_download
 from jaxtyping import Int
 from torch import Tensor
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
 from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, FSDPModule, MixedPrecisionPolicy, OffloadPolicy, fully_shard
-from torch.distributed.tensor.parallel import parallelize_module
-from torchtitan.distributed.expert_parallel import ExpertParallel
+from torch.distributed.tensor import Shard
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GenerationConfig, PretrainedConfig
 from transformers.tokenization_utils import PreTrainedTokenizer
 from transformers.utils.import_utils import is_flash_attn_3_available
 
-from prime_rl.configs.trainer import ActivationCheckpointConfig, CompileConfig, ModelConfig, TokenizerConfig
-from prime_rl.trainer.distributed import DeepEPExpertParallel
+from prime_rl.configs.trainer import (
+    ActivationCheckpointConfig,
+    CompileConfig,
+    FP8Config,
+    ModelConfig,
+    MXFP8Config,
+    TokenizerConfig,
+)
+from prime_rl.multimodal import ForwardPolicy
+from prime_rl.trainer.activation_checkpointing import get_activation_checkpoint_wrapper
 from prime_rl.trainer.lora import apply_lora_to_model, freeze_all_except_lora_and_specified, strip_lora_from_state_dict
 from prime_rl.trainer.models import (
     AutoModelForCausalLMPrimeRL,
     PreTrainedModelPrimeRL,
     PrimeLmOutput,
     cast_float_and_contiguous,
+    get_custom_causal_lm_cls,
     get_custom_vlm_cls,
     supports_custom_impl,
 )
-from prime_rl.trainer.models.layers.checkpointing import (
-    get_supported_targets,
-    set_selective_activation_checkpointing,
-    supports_selective_activation_checkpointing,
+from prime_rl.trainer.models.deepseek_v4.attention import DeepseekV4Indexer
+from prime_rl.trainer.models.fusions import (
+    apply_model_fusions,
+    get_fsdp_shard_placement_fn,
+    write_back_loaded_packed_parameters,
 )
+from prime_rl.trainer.models.glm_moe_dsa.sparse_mla_attention import Indexer
 from prime_rl.trainer.models.layers.fp8_linear import replace_linear_with_fp8_blockwise_linear
 from prime_rl.trainer.models.layers.lm_head import inject_prime_lm_head
-from prime_rl.trainer.models.layers.moe import LatentMoE, MoE
+from prime_rl.trainer.models.layers.moe import MoE, TokenChoiceTopKRouter
+from prime_rl.trainer.models.layers.mxfp8_linear import replace_linear_with_mxfp8_linear
+from prime_rl.trainer.moe_runtime import configure_moe_runtime
 from prime_rl.trainer.parallel_dims import ParallelDims
-from prime_rl.trainer.weights import (
+from prime_rl.trainer.world import get_world
+from prime_rl.utils.logger import get_logger
+from prime_rl.utils.utils import format_time
+from prime_rl.utils.vlm import get_language_model, get_vision_encoder, is_vlm_architecture
+from prime_rl.utils.weights import (
     load_state_dict,
     load_state_dict_keys,
     save_state_dict,
 )
-from prime_rl.trainer.world import get_world
-from prime_rl.utils.logger import get_logger
-from prime_rl.utils.sequence import get_cu_seqlens_from_position_ids
-from prime_rl.utils.utils import format_time
-from prime_rl.utils.vlm import get_language_model, get_vision_encoder, is_vlm_architecture
 
 
-def pre_download_model(model_name: str) -> None:
-    """Pre-download model from HuggingFace Hub so all nodes have cached weights before training."""
+def pre_download_model(model_name: str, *, skip_weights: bool = False) -> None:
+    """Pre-download model from HuggingFace Hub so all nodes have cached weights before training.
+
+    With ``skip_weights`` (random-init debug runs), only config and tokenizer files are fetched.
+    """
     if Path(model_name).exists():
         get_logger().info(f"Model {model_name} found at local path, skipping download")
         return
-    get_logger().info(f"Pre-downloading model {model_name}")
     t0 = time.perf_counter()
-    path = snapshot_download(repo_id=model_name, repo_type="model")
+    if skip_weights:
+        get_logger().info(f"Pre-downloading config and tokenizer for {model_name} (random init, skipping weights)")
+        path = snapshot_download(
+            repo_id=model_name, repo_type="model", allow_patterns=["*.json", "*.txt", "tokenizer*", "*.jinja"]
+        )
+    else:
+        get_logger().info(f"Pre-downloading model {model_name}")
+        path = snapshot_download(repo_id=model_name, repo_type="model")
     get_logger().debug(
         f"Finished pre-downloading model {model_name} to {path} in {format_time(time.perf_counter() - t0)}"
     )
-
-
-def _patch_qwen3_5_moe_conversion_mapping():
-    """Fix Qwen3.5 MoE conversion mapping incorrectly applying qwen2_moe expert weight splitting.
-
-    Qwen3.5 MoE stores expert weights as fused 3D tensors natively in the checkpoint
-    (e.g. experts.gate_up_proj [num_experts, 2*intermediate, hidden]). The upstream mapping
-    incorrectly maps qwen3_5_moe → qwen2_moe, which assumes per-expert 2D checkpoint weights,
-    causing revert_weight_conversion to produce wrong shapes during weight broadcasting.
-
-    Remove once the pinned transformers commit fixes this.
-    """
-    from transformers.conversion_mapping import (
-        get_checkpoint_conversion_mapping,
-        register_checkpoint_conversion_mapping,
-    )
-
-    # qwen3_5_moe_text: keep only the qwen3_5_text renaming, remove qwen2_moe expert conversion
-    qwen3_5_text_mapping = get_checkpoint_conversion_mapping("qwen3_5_text")
-    if qwen3_5_text_mapping is not None:
-        register_checkpoint_conversion_mapping("qwen3_5_moe_text", qwen3_5_text_mapping, overwrite=True)
-
-    # qwen3_5_moe: remove the qwen2_moe fallback entirely
-    register_checkpoint_conversion_mapping("qwen3_5_moe", [], overwrite=True)
-
-
-def _patch_qwen3_5_text_position_ids():
-    """Fix Qwen3.5 passing 3D MRoPE position_ids to decoder layers instead of 2D text_position_ids.
-
-    Upstream fix: https://github.com/huggingface/transformers/pull/44399
-    Remove once the pinned transformers commit includes this fix.
-    """
-    import inspect
-
-    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5TextModel
-    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeDecoderLayer, Qwen3_5MoeTextModel
-
-    for text_model_cls, decoder_layer_cls in [
-        (Qwen3_5TextModel, Qwen3_5DecoderLayer),
-        (Qwen3_5MoeTextModel, Qwen3_5MoeDecoderLayer),
-    ]:
-        source = inspect.getsource(text_model_cls.forward)
-        if "decoder_layer" in source and "position_ids=text_position_ids" in source.split("decoder_layer")[-1]:
-            continue  # already fixed upstream
-
-        _original_forward = decoder_layer_cls.forward
-
-        def _make_patched_forward(original):
-            def _patched_forward(self, hidden_states, position_ids=None, **kwargs):
-                if position_ids is not None and position_ids.ndim == 3:
-                    position_ids = position_ids[0]
-                return original(self, hidden_states, position_ids=position_ids, **kwargs)
-
-            return _patched_forward
-
-        decoder_layer_cls.forward = _make_patched_forward(_original_forward)
-
-
-def _patch_qwen3_5_linear_attn_varlen():
-    """Thread cu_seqlens through Qwen3.5 GatedDeltaNet so packed batches don't
-    leak conv/SSM state across sequences.
-
-    HF's forward hardcodes seq_idx=None for causal_conv1d and omits cu_seqlens
-    for chunk_gated_delta_rule, so packed RL training sees ~0.23 Mismatch KL vs
-    vLLM (target <0.01). Mirrors the NemotronH mamba fix.
-    """
-    import torch.nn.functional as F
-    from transformers.models.qwen3_5.modeling_qwen3_5 import (
-        Qwen3_5DecoderLayer,
-        Qwen3_5GatedDeltaNet,
-        Qwen3_5TextModel,
-        apply_mask_to_padding_states,
-    )
-
-    if getattr(Qwen3_5GatedDeltaNet.forward, "_prl_varlen_patched", False):
-        return
-
-    _gdn_orig = Qwen3_5GatedDeltaNet.forward
-
-    def _gdn_forward(self, hidden_states, cache_params=None, attention_mask=None, cu_seqlens=None):
-        if cu_seqlens is None or cache_params is not None:
-            return _gdn_orig(self, hidden_states, cache_params=cache_params, attention_mask=attention_mask)
-
-        hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
-        batch_size, seq_len, _ = hidden_states.shape
-
-        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
-        z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
-
-        if self.causal_conv1d_fn is not None:
-            seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            seq_idx = torch.repeat_interleave(
-                torch.arange(seg_lens.numel(), dtype=torch.int32, device=hidden_states.device),
-                seg_lens,
-            ).unsqueeze(0)
-            mixed_qkv = self.causal_conv1d_fn(
-                x=mixed_qkv,
-                weight=self.conv1d.weight.squeeze(1),
-                bias=self.conv1d.bias,
-                activation=self.activation,
-                seq_idx=seq_idx,
-            )
-        else:
-            # Per-segment conv1d so the kernel-1 left pad only draws from within each sequence.
-            cu = cu_seqlens.tolist()
-            conv_outs = []
-            for i in range(len(cu) - 1):
-                s, e = cu[i], cu[i + 1]
-                if s == e:
-                    continue
-                conv_outs.append(self.conv1d(mixed_qkv[:, :, s:e])[:, :, : e - s])
-            mixed_qkv = F.silu(torch.cat(conv_outs, dim=-1))
-
-        mixed_qkv = mixed_qkv.transpose(1, 2)
-        query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
-
-        beta = b.sigmoid()
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
-        core_attn_out, _ = self.chunk_gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=True,
-            cu_seqlens=cu_seqlens,
-        )
-
-        core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
-        z = z.reshape(-1, self.head_v_dim)
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
-        return self.out_proj(core_attn_out)
-
-    _gdn_forward._prl_varlen_patched = True
-    Qwen3_5GatedDeltaNet.forward = _gdn_forward
-
-    _dec_orig = Qwen3_5DecoderLayer.forward
-
-    def _dec_forward(
-        self,
-        hidden_states,
-        position_embeddings,
-        attention_mask=None,
-        position_ids=None,
-        past_key_values=None,
-        cu_seqlens=None,
-        **kwargs,
-    ):
-        if position_ids is not None and position_ids.ndim == 3:
-            position_ids = position_ids[0]
-        if self.layer_type != "linear_attention":
-            return _dec_orig(
-                self,
-                hidden_states,
-                position_embeddings=position_embeddings,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                **kwargs,
-            )
-
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.linear_attn(
-            hidden_states=hidden_states,
-            cache_params=past_key_values,
-            attention_mask=attention_mask,
-            cu_seqlens=cu_seqlens,
-        )
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        return residual + hidden_states
-
-    Qwen3_5DecoderLayer.forward = _dec_forward
-
-    _text_orig = Qwen3_5TextModel.forward
-
-    def _text_forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        position_ids=None,
-        past_key_values=None,
-        inputs_embeds=None,
-        use_cache=None,
-        **kwargs,
-    ):
-        attn_impl = getattr(self.config, "_attn_implementation", None)
-        cu_seqlens = None
-        if attn_impl in ("flash_attention_2", "flash_attention_3", "fa4") and position_ids is not None:
-            pids = position_ids
-            if pids.ndim == 3:
-                pids = pids[0]
-            cu_seqlens, _ = get_cu_seqlens_from_position_ids(pids)
-        kwargs["cu_seqlens"] = cu_seqlens
-        return _text_orig(
-            self,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            **kwargs,
-        )
-
-    Qwen3_5TextModel.forward = _text_forward
 
 
 # Add filter to the standard logging module for transformers.modeling_utils to supress the
@@ -333,13 +131,13 @@ def freeze_moe_router(model: nn.Module) -> None:
         if mlp is None:
             continue
 
-        # Custom implementation: MoE/LatentMoE class with router attribute
-        if isinstance(mlp, (MoE, LatentMoE)):
+        # Custom implementation
+        if isinstance(mlp, MoE):
             for param in mlp.router.parameters():
                 param.requires_grad = False
                 num_frozen += 1
-        # HuggingFace implementation: gate attribute (nn.Linear)
-        elif hasattr(mlp, "gate") and isinstance(mlp.gate, nn.Linear):
+        # HuggingFace implementation: gate may have been wrapped with LoRA.
+        elif hasattr(mlp, "gate") and isinstance(mlp.gate, nn.Module):
             for param in mlp.gate.parameters():
                 param.requires_grad = False
                 num_frozen += 1
@@ -350,6 +148,74 @@ def freeze_moe_router(model: nn.Module) -> None:
     logger.info(f"Froze {num_frozen} MoE router parameters")
 
 
+def apply_fp32_moe_router(model: nn.Module) -> None:
+    """Cast MoE router gates to fp32 so routing runs in fp32 in forward and backward.
+
+    The FSDP bf16 cast exemption is applied separately in `setup_fsdp`.
+    """
+    logger = get_logger()
+    language_model = get_language_model(model)
+    num_routers = 0
+
+    for layer in language_model.layers:
+        mlp = layer.mlp if hasattr(layer, "mlp") else layer.feed_forward if hasattr(layer, "feed_forward") else None
+        if isinstance(mlp, MoE):
+            mlp.router.to(torch.float32)
+            if isinstance(mlp.router, TokenChoiceTopKRouter):
+                mlp.router.fp32_gate = True
+            num_routers += 1
+
+    # No-op for non-MoE and HF-impl models: moe_router_dtype='float32' is the default,
+    # so absence of custom-impl MoE routers is the common case, not an error.
+    if num_routers > 0:
+        logger.info(f"Running {num_routers} MoE router gates in fp32")
+
+
+def get_full_offload_dtype_policy(
+    model: nn.Module,
+    config: ModelConfig,
+) -> dict[int, tuple[torch.dtype, torch.dtype]]:
+    """Return persistent parameter and reduced-gradient dtypes for full offload."""
+    # FSDP casts reduced gradients back to the persistent sharded-parameter dtype.
+    policy = {id(param): (torch.bfloat16, torch.bfloat16) for param in model.parameters() if param.is_floating_point()}
+    if config.moe_router_dtype != "float32":
+        return policy
+
+    language_model = get_language_model(model)
+    for layer in language_model.layers:
+        mlp = layer.mlp if hasattr(layer, "mlp") else layer.feed_forward if hasattr(layer, "feed_forward") else None
+        if isinstance(mlp, MoE):
+            for param in mlp.router.parameters():
+                if param.is_floating_point():
+                    policy[id(param)] = (torch.float32, torch.float32)
+    return policy
+
+
+def freeze_sparse_indexer(model: nn.Module) -> None:
+    """Freeze sparse-attention indexer parameters.
+
+    An indexer forward runs under `torch.no_grad()`, so its params never receive a gradient
+    and cannot be trained. Left with requires_grad=True they stay stateless in the optimizer,
+    which breaks strict checkpoint resume: DCP materializes optimizer state for every
+    requires_grad param at load time, but the stateless params were never saved -> "Missing
+    key in checkpoint state_dict". Freezing them keeps the saved and loaded optimizer state
+    symmetric.
+    """
+    # TODO: no model here trains its indexer. DeepSeek's auxiliary KL objective, which supervises
+    # the top-k selection, is unimplemented, so these params are frozen rather than learned.
+    logger = get_logger()
+    num_frozen = 0
+
+    for module in model.modules():
+        if isinstance(module, (Indexer, DeepseekV4Indexer)):
+            for param in module.parameters():
+                param.requires_grad = False
+                num_frozen += 1
+
+    if num_frozen > 0:
+        logger.info(f"Froze {num_frozen} sparse indexer parameters")
+
+
 def apply_force_balanced_routing(model: nn.Module) -> None:
     """Force MoE token-choice routers into round-robin assignment for fake-data smoke tests."""
     logger = get_logger()
@@ -358,7 +224,7 @@ def apply_force_balanced_routing(model: nn.Module) -> None:
 
     for layer in language_model.layers:
         mlp = layer.mlp if hasattr(layer, "mlp") else layer.feed_forward if hasattr(layer, "feed_forward") else None
-        if isinstance(mlp, (MoE, LatentMoE)):
+        if isinstance(mlp, MoE):
             mlp.router.force_balanced = True
             num_routers += 1
 
@@ -372,70 +238,83 @@ def apply_force_balanced_routing(model: nn.Module) -> None:
 
 
 def is_tt_moe_model(model: nn.Module) -> bool:
-    return hasattr(model.config, "num_experts") or hasattr(model.config, "n_routed_experts")
-
-
-def configure_moe_ep_backend(model: nn.Module, config: ModelConfig) -> None:
-    backend = config.ep_comm_backend
-    if backend == "deepep":
-        from prime_rl.trainer.distributed.deepep import configure_num_sms
-
-        configure_num_sms(config.deepep_num_sms)
-    language_model = get_language_model(model)
-    for transformer_block in language_model.layers:
-        if not isinstance(transformer_block.mlp, (MoE, LatentMoE)):
-            continue
-        transformer_block.mlp.set_ep_comm_backend(backend)
-        transformer_block.mlp.set_deepep_token_chunk_size(config.deepep_token_chunk_size)
+    config = getattr(model.config, "text_config", model.config)
+    return hasattr(config, "num_experts") or hasattr(config, "n_routed_experts")
 
 
 def get_load_balance_stats(
-    model: nn.Module, reset_stats: bool = True, try_to_avoid_padding_experts: bool = True
+    model: nn.Module,
+    group: dist.ProcessGroup | None = None,
 ) -> dict[str, Tensor | None]:
+    """Compute routing stats after summing raw counts across the group, if given."""
     per_layer_max_vio = []
     per_layer_routing_confidence = []
     language_model = get_language_model(model)
+    block_mlps = []
     for transformer_block in language_model.layers:
         # This is necessary for models that have mixed dense layers
         block_mlp = getattr(transformer_block, "mlp", None)
-        if block_mlp is None or not hasattr(block_mlp, "tokens_per_expert"):
-            continue
-        tokens_per_expert: torch.Tensor = block_mlp.tokens_per_expert
+        if block_mlp is not None and hasattr(block_mlp, "tokens_per_expert"):
+            block_mlps.append(block_mlp)
+    if not block_mlps:
+        return {"max_vio": None, "routing_confidence": None}
+
+    layer_stats = [(block_mlp.tokens_per_expert, block_mlp.routing_confidence_sum) for block_mlp in block_mlps]
+    if group is not None:
+        sizes = [tokens_per_expert.numel() + 1 for tokens_per_expert, _ in layer_stats]
+        packed_stats = torch.cat(
+            [torch.cat((tokens_per_expert, confidence.reshape(1))) for tokens_per_expert, confidence in layer_stats]
+        )
+        dist.all_reduce(packed_stats, op=dist.ReduceOp.SUM, group=group)
+        layer_stats = [(stats[:-1], stats[-1]) for stats in packed_stats.split(sizes)]
+
+    for block_mlp, (tokens_per_expert, routing_confidence_sum) in zip(block_mlps, layer_stats):
         num_routed_tokens = tokens_per_expert.sum() / block_mlp.router.top_k
-        if try_to_avoid_padding_experts:
-            tokens_per_expert = tokens_per_expert.sort(dim=0, descending=True).values[block_mlp.router.top_k :]
+        tokens_per_expert = tokens_per_expert.sort(dim=0, descending=True).values[block_mlp.router.top_k :]
         balanced_load = tokens_per_expert.mean()
         max_vio = (tokens_per_expert.max() - balanced_load) / balanced_load
         per_layer_max_vio.append(max_vio.detach())
 
-        routing_confidence = block_mlp.routing_confidence_sum / num_routed_tokens
+        routing_confidence = routing_confidence_sum / num_routed_tokens
         per_layer_routing_confidence.append(routing_confidence.detach())
 
-        if reset_stats:
-            block_mlp.tokens_per_expert.zero_()
-            block_mlp.routing_confidence_sum.zero_()
-    if len(per_layer_max_vio) == 0:
-        return {"max_vio": None, "routing_confidence": None}
+        block_mlp.tokens_per_expert.zero_()
+        block_mlp.routing_confidence_sum.zero_()
     return {
         "max_vio": torch.stack(per_layer_max_vio),
         "routing_confidence": torch.stack(per_layer_routing_confidence),
     }
 
 
+def get_global_moe_stats(
+    model: nn.Module,
+    ep_group: dist.ProcessGroup | None,
+    dp_cp_group: dist.ProcessGroup,
+) -> dict[str, Tensor]:
+    """Reduce one microstep's routing stats across EP, then DP and CP ranks."""
+    stats = {}
+    for name, values in get_load_balance_stats(model, group=ep_group).items():
+        if values is None:
+            continue
+        value = values.max() if name == "max_vio" else values.mean()
+        if name == "max_vio":
+            dist.all_reduce(value, op=dist.ReduceOp.MAX, group=dp_cp_group)
+        else:
+            dist.all_reduce(value, op=dist.ReduceOp.SUM, group=dp_cp_group)
+            value /= dist.get_world_size(dp_cp_group)
+        stats[name] = value.to("cpu")
+    return stats
+
+
 def get_model(
     config: ModelConfig, device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.bfloat16
 ) -> nn.Module:
     logger = get_logger()
-    logger.info(
+    logger.debug(
         f"Loading model config (name={config.name}, attn={config.attn}, trust_remote_code={config.trust_remote_code})"
     )
 
     is_vlm_training = config.vlm is not None
-
-    if "Qwen3.5" in config.name or "qwen3_5" in config.name.lower():
-        _patch_qwen3_5_text_position_ids()
-        _patch_qwen3_5_moe_conversion_mapping()
-        _patch_qwen3_5_linear_attn_varlen()
 
     model_config = cast(
         PretrainedConfig,
@@ -448,44 +327,27 @@ def get_model(
 
     if is_vlm_training:
         logger.info(f"Detected vision-language model: {config.name}")
-        if config.optimization_dtype != "bfloat16" or config.reduce_dtype != "bfloat16":
-            raise ValueError(
-                "VLM models must use optimization_dtype='bfloat16' and reduce_dtype='bfloat16' to match vLLM inference."
-            )
 
-    # GPT-OSS only supports FlashAttention via kernels-community/vllm-flash-attn3, which requires Hopper (SM 90).
-    # On other architectures (e.g. Blackwell), users must fall back to eager attention.
-    HOPPER_MAJOR = 9
-    if getattr(model_config, "model_type", "") == "gpt_oss":
-        if config.attn != "eager":
-            major, minor = torch.cuda.get_device_capability()
-            if major != HOPPER_MAJOR:
-                raise ValueError(
-                    f"GPT-OSS requires 'attn = \"eager\"' on non-Hopper GPUs (detected SM {major}{minor}). "
-                    f"The only flash attention kernel supported by GPT-OSS (kernels-community/vllm-flash-attn3) is Hopper-only. "
-                    f'Set [trainer.model] attn = "eager" in your config.'
-                )
-        # Enable hub kernels for GPT-OSS (disabled by default to avoid interfering with other models).
-        import transformers.integrations.hub_kernels as _hub_kernels
-
-        _hub_kernels._kernels_enabled = True
-
-    # Fallback Qwen3.5 patch detection from loaded config model_type
-    if getattr(model_config, "model_type", "").startswith("qwen3_5_moe"):
-        _patch_qwen3_5_text_position_ids()
-        _patch_qwen3_5_moe_conversion_mapping()
-        _patch_qwen3_5_linear_attn_varlen()
     for subconfig_key in getattr(model_config, "sub_configs", {}):
         subconfig = getattr(model_config, subconfig_key, None)
         if subconfig is not None and hasattr(subconfig, "use_cache"):
             subconfig.use_cache = False
-    model_config.use_grouped_mm = config.moe_use_grouped_mm
-    model_config.fp8 = config.fp8
-
     if config.index_cache is not None:
         model_config.use_index_cache = True
         model_config.index_topk_freq = config.index_cache.topk_freq
         model_config.index_topk_pattern = config.index_cache.topk_pattern
+        # Explicit override supersedes the model's native IndexShare schedule.
+        model_config.indexer_types = None
+    else:
+        # Auto-enable IndexShare from the model's own indexer schedule (e.g. GLM-5.2). The model
+        # reads `indexer_types` directly: shared layers reuse cached indices and carry no indexer weights.
+        indexer_types = getattr(model_config, "indexer_types", None)
+        if indexer_types and any(t == "shared" for t in indexer_types):
+            model_config.use_index_cache = True
+            logger.info(
+                f"Auto-enabled IndexShare from indexer_types schedule "
+                f"({sum(t == 'full' for t in indexer_types)}/{len(indexer_types)} full layers)"
+            )
 
     # Ensure pad_token_id is set (some models like Qwen3MoE don't have it).
     # In transformers v5, token IDs moved from PretrainedConfig to GenerationConfig.
@@ -538,6 +400,36 @@ def get_model(
     else:
         impl_to_use = config.impl
 
+    if config.attn in ("flash_attention_3", "flash_attention_4") and impl_to_use == "hf":
+        raise ValueError(
+            f"{config.attn} requires model.impl='custom' or 'auto' (resolved to 'custom'), "
+            f"but model.impl resolved to 'hf'. Set model.impl='custom' explicitly."
+        )
+
+    if config.cp > 1 and config.impl == "auto" and impl_to_use != "custom":
+        raise ValueError(
+            "Context parallelism with model.impl='auto' requires a supported custom PrimeRL implementation, "
+            "but this architecture resolved to model.impl='hf'."
+        )
+
+    # Past the check above, cp > 1 implies impl_to_use == "custom", so the model class always
+    # resolves. Queried here so a misconfigured job dies at setup rather than at the first forward.
+    if config.cp > 1:
+        cp_model_cls = custom_vlm_cls or get_custom_causal_lm_cls(model_config)
+        support = cp_model_cls.cp_support(model_config)
+        if config.cp_style not in support.styles:
+            supported = f"supported styles: {sorted(support.styles)}" if support.styles else "set cp=1"
+            raise ValueError(
+                f"{model_config.model_type!r} does not support cp_style={config.cp_style!r} "
+                f"({support.reason}); {supported}."
+            )
+
+    if config.vlm is not None and not (is_vlm_arch and custom_vlm_cls):
+        raise ValueError(
+            "VLM training requires a registered custom PrimeRL VLM implementation; "
+            f"{getattr(model_config, 'model_type', config.name)!r} has none."
+        )
+
     with device:
         if impl_to_use == "custom" and custom_vlm_cls is not None:
             model_cls = custom_vlm_cls
@@ -567,11 +459,7 @@ def get_model(
                 trust_remote_code=config.trust_remote_code,
                 **dtype_kwarg,
             )
-        logger.debug(f"Loaded model {config.name} in {time.perf_counter() - load_model_start_time:.2f} seconds")
-
-    # For VLM models, optionally freeze the vision encoder
-    if is_vlm_training and config.vlm.freeze_vision_encoder:
-        freeze_vision_encoder(model, override_attr=config.vlm.vision_encoder_attr)
+        logger.debug(f"Loaded model {config.name} in {format_time(time.perf_counter() - load_model_start_time)}")
 
     assert model.lm_head.weight.dtype == dtype, (
         f"LM head dtype wasnt loaded correctly {model.lm_head.weight.dtype} != {dtype}"
@@ -596,17 +484,43 @@ def setup_tokenizer(config: TokenizerConfig) -> PreTrainedTokenizer:
     return tokenizer
 
 
+def setup_processor(config: ModelConfig):
+    """Load an ``AutoProcessor`` for VLM models. Returns ``None`` for text-only models."""
+    from transformers import AutoProcessor
+
+    logger = get_logger()
+    try:
+        processor = AutoProcessor.from_pretrained(config.name, trust_remote_code=config.trust_remote_code)
+    except (ValueError, OSError, KeyError) as e:
+        logger.debug(f"No AutoProcessor available for {config.name} ({type(e).__name__}); treating as text-only.")
+        return None
+    if not (getattr(processor, "image_processor", None) or getattr(processor, "video_processor", None)):
+        logger.debug(f"AutoProcessor for {config.name} has no image/video processor; treating as text-only.")
+        return None
+    logger.info(f"Loaded multimodal processor: {type(processor).__name__}")
+    return processor
+
+
 def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
     mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=DTYPE_MAP[config.reduce_dtype])
     offload_policy: OffloadPolicy = CPUOffloadPolicy(pin_memory=True) if config.fsdp_cpu_offload else OffloadPolicy()
+
+    fused_shard_placement_fn = get_fsdp_shard_placement_fn(model) if config.fusions.shard_fused_on_dim1 else None
+    hsdp_mesh = parallel_dims.get_mesh("hsdp")
+    shard_size = parallel_dims.get_mesh("dp_shard_cp").size()
+
+    def shard_placement_fn(parameter: nn.Parameter) -> Shard | None:
+        # Qwen's single-row shared-expert gates need equal shards for Muon's all-to-all.
+        if parameter.ndim == 2 and parameter.shape[0] == 1 and parameter.shape[1] % shard_size == 0:
+            return Shard(1)
+        return fused_shard_placement_fn(parameter) if fused_shard_placement_fn is not None else None
 
     fsdp_config = {
         "mp_policy": mp_policy,
         "offload_policy": offload_policy,
         "reshard_after_forward": config.reshard_after_forward,
+        "shard_placement_fn": shard_placement_fn,
     }
-
-    hsdp_mesh = parallel_dims.get_mesh("hsdp")
 
     dp_mod_ep_mesh: DeviceMesh | None = None
     if parallel_dims.ep_enabled:
@@ -631,10 +545,24 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
 
     for transformer_block in transformer_layers:
         block_mlp = getattr(transformer_block, "mlp", None)
-        if parallel_dims.ep_enabled and block_mlp is not None and isinstance(block_mlp, (MoE, LatentMoE)):
+        if parallel_dims.ep_enabled and block_mlp is not None and isinstance(block_mlp, MoE):
             fully_shard(block_mlp.experts, mesh=dp_mod_ep_mesh, **fsdp_config)
 
             block_mlp.experts.set_gradient_divide_factor(parallel_dims.fsdp_gradient_divide_factor)
+
+        if config.moe_router_dtype == "float32" and isinstance(block_mlp, MoE):
+            # Own FSDP unit with an fp32 policy so the gate weight is not cast to
+            # bf16 for forward and its gradients reduce in fp32.
+            fully_shard(
+                block_mlp.router,
+                mesh=hsdp_mesh,
+                mp_policy=MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32),
+                offload_policy=offload_policy,
+                reshard_after_forward=config.reshard_after_forward,
+                shard_placement_fn=shard_placement_fn,
+            )
+            # Keep the router reduction from waiting for the expert reduction's input buffer.
+            block_mlp.router.set_reduce_scatter_max_input_buffers(2)
 
         fully_shard(
             transformer_block,
@@ -659,6 +587,7 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
             mp_policy=mp_policy,
             offload_policy=offload_policy,
             reshard_after_forward=False,
+            shard_placement_fn=shard_placement_fn,
         )
     else:
         get_logger().warning("Model uses tied word embeddings, so skipping the last-layer no-reshard optimization.")
@@ -669,6 +598,7 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
         mp_policy=mp_policy,
         offload_policy=offload_policy,
         reshard_after_forward=config.reshard_after_forward,
+        shard_placement_fn=shard_placement_fn,
     )
 
     if not parallel_dims.ep_enabled:
@@ -688,8 +618,12 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
     for transformer_block, next_transformer_block in zip(transformer_blocks, next_transformer_blocks):
         if next_transformer_block is not None:
             next_mlp = getattr(next_transformer_block, "mlp", None)
-            if next_mlp is not None and isinstance(next_mlp, (MoE, LatentMoE)):
-                transformer_block.set_modules_to_forward_prefetch([next_transformer_block, next_mlp.experts])
+            if next_mlp is not None and isinstance(next_mlp, MoE):
+                prefetch_modules = [next_transformer_block]
+                if isinstance(next_mlp.router, FSDPModule):
+                    prefetch_modules.append(next_mlp.router)
+                prefetch_modules.append(next_mlp.experts)
+                transformer_block.set_modules_to_forward_prefetch(prefetch_modules)
             else:
                 transformer_block.set_modules_to_forward_prefetch([next_transformer_block])
         elif language_model.norm is not None and model.lm_head is not None:
@@ -701,16 +635,27 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
     prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
 
     if language_model.norm is not None and model.lm_head is not None and len(language_model.layers) > 0:
+        last_transformer_block = reversed_transformer_blocks[0]
+        prefetch_modules = [last_transformer_block]
+        last_mlp = getattr(last_transformer_block, "mlp", None)
+        if last_mlp is not None and isinstance(last_mlp, MoE):
+            prefetch_modules.append(last_mlp.experts)
+            if isinstance(last_mlp.router, FSDPModule):
+                prefetch_modules.append(last_mlp.router)
+
         if shard_norm_and_lm_head:
-            model.lm_head.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
+            model.lm_head.set_modules_to_backward_prefetch(prefetch_modules)
         else:
-            model.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
+            model.set_modules_to_backward_prefetch(prefetch_modules)
 
     for transformer_block, prev_transformer_block in zip(reversed_transformer_blocks, prev_transformer_blocks):
         if prev_transformer_block is not None:
             prev_mlp = getattr(prev_transformer_block, "mlp", None)
-            if prev_mlp is not None and isinstance(prev_mlp, (MoE, LatentMoE)):
-                transformer_block.set_modules_to_backward_prefetch([prev_transformer_block, prev_mlp.experts])
+            if prev_mlp is not None and isinstance(prev_mlp, MoE):
+                prefetch_modules = [prev_transformer_block, prev_mlp.experts]
+                if isinstance(prev_mlp.router, FSDPModule):
+                    prefetch_modules.append(prev_mlp.router)
+                transformer_block.set_modules_to_backward_prefetch(prefetch_modules)
             else:
                 transformer_block.set_modules_to_backward_prefetch([prev_transformer_block])
         elif embed_module is not None:
@@ -723,16 +668,15 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
     model.to_empty(device=device)
     torch.distributed.barrier()
 
-    def _init_buffers_post_meta():
-        if isinstance(model, PreTrainedModelPrimeRL):
-            model.init_buffers_post_meta()
-        else:
-            fix_model_post_empty(model)
+    # Must run before any weight loading: reinit can zero persistent buffers that ship in checkpoints
+    if isinstance(model, PreTrainedModelPrimeRL):
+        model.init_buffers_post_meta()
+    else:
+        fix_model_post_empty(model)
 
     logger = get_logger()
     if config.debug.random_init:
         logger.warning("Randomly initializing model. Skipping loading weights from HF.")
-        _init_buffers_post_meta()
         _move_buffers_to_cuda(model, config)
         return
 
@@ -748,54 +692,69 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
     # All ranks read just the key names (cheap) to determine the path independently.
     # Only master loads the full state dict when conversion is actually needed.
     if isinstance(model, PreTrainedModelPrimeRL):
-        snapshot_keys = dict.fromkeys(load_state_dict_keys(snapshot_path))
+        source_path = snapshot_path
+        convert_dir = config.conversion_dir or source_path
+        snapshot_keys = dict.fromkeys(load_state_dict_keys(source_path))
         model_keys = dict.fromkeys(model.state_dict().keys())
 
-        if model.is_hf_state_dict(snapshot_keys) and model.is_prime_state_dict(model_keys):
+        if source_path.name == "prime" and not (source_path / ".prime-v1").is_file():
+            raise RuntimeError(f"PrimeRL conversion cache {source_path} is missing the required .prime-v1 marker")
+
+        snapshot_is_hf = model.is_hf_state_dict(snapshot_keys)
+        snapshot_is_prime = model.is_prime_state_dict(snapshot_keys)
+
+        if snapshot_is_hf and not snapshot_is_prime and model.is_prime_state_dict(model_keys):
             logger.warning(
                 "Found HF weight format in snapshot state dict and PrimeRL weight format in model state dict. Trying to auto-convert..."
             )
-            snapshot_path = snapshot_path / "prime"
+            snapshot_path = convert_dir / "prime"
             if not snapshot_path.exists() and get_world().is_master:
                 logger.debug(
                     f"Converting snapshot state dict to PrimeRL format and saving to {snapshot_path} on master rank. This is a one-time operation."
                 )
-                snapshot_state_dict = load_state_dict(snapshot_path.parent)
+                snapshot_state_dict = load_state_dict(source_path)
                 model.convert_to_prime(snapshot_state_dict)
                 save_state_dict(snapshot_state_dict, snapshot_path)
+                (snapshot_path / ".prime-v1").touch()
                 del snapshot_state_dict
 
-        elif model.is_prime_state_dict(snapshot_keys) and model.is_hf_state_dict(model_keys):
+        elif snapshot_is_prime and not snapshot_is_hf and model.is_hf_state_dict(model_keys):
             logger.warning(
                 "Found PrimeRL weight format in snapshot state dict and HF weight format in model state dict. Trying to auto-convert..."
             )
-            snapshot_path = snapshot_path / "hf"
+            snapshot_path = convert_dir / "hf"
             if not snapshot_path.exists() and get_world().is_master:
                 logger.debug(
                     f"Converting snapshot state dict to HF format and saving to {snapshot_path} on master rank. This is a one-time operation."
                 )
-                snapshot_state_dict = load_state_dict(snapshot_path.parent)
+                snapshot_state_dict = load_state_dict(source_path)
                 model.convert_to_hf(snapshot_state_dict)
                 save_state_dict(snapshot_state_dict, snapshot_path)
                 del snapshot_state_dict
 
     # All ranks wait for master rank to finish conversion
     torch.distributed.barrier()
+    if (
+        isinstance(model, PreTrainedModelPrimeRL)
+        and snapshot_path.name == "prime"
+        and not (snapshot_path / ".prime-v1").is_file()
+    ):
+        raise RuntimeError(f"PrimeRL conversion cache {snapshot_path} is missing the required .prime-v1 marker")
 
     logger.info(f"Loading weights using HF DCP from {snapshot_path}")
     load_dcp_start_time = time.perf_counter()
     state_dict = model.state_dict()
     state_dict = strip_lora_from_state_dict(state_dict)
     if model.config.tie_word_embeddings:
-        del state_dict["lm_head.weight"]
+        state_dict.pop("lm_head.weight")
     dcp_load(
         state_dict,
         storage_reader=HuggingFaceStorageReader(path=snapshot_path.as_posix()),
     )
+    write_back_loaded_packed_parameters(model, state_dict)
     # Restore weight tying broken by to_empty() for HF models
     if not isinstance(model, PreTrainedModelPrimeRL) and model.config.tie_word_embeddings:
         model.tie_weights()
-    _init_buffers_post_meta()
 
     _move_buffers_to_cuda(model, config)
 
@@ -812,7 +771,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
             generator = torch.Generator(device="cuda").manual_seed(seed_tensor.item())
         for module in lora_modules:
             module._init_lora_parameters(generator)
-    logger.debug(f"Loaded weights using HF DCP in {time.perf_counter() - load_dcp_start_time:.2f} seconds")
+    logger.debug(f"Loaded weights using HF DCP in {format_time(time.perf_counter() - load_dcp_start_time)}")
 
 
 def can_reinit_empty_buffers(model: nn.Module):
@@ -834,7 +793,9 @@ def can_reinit_empty_buffers(model: nn.Module):
         if not (name.startswith("model.layers.") and name.endswith("mlp.tokens_per_expert"))
     ]
     buffer_names = [
-        name for name in buffer_names if not (name.startswith("model.layers.") and name.endswith("mlp.expert_bias"))
+        name
+        for name in buffer_names
+        if not (name.startswith("model.layers.") and name.endswith("mlp.router.selection_bias"))
     ]
     # HF standard transformer model
     if len(buffer_names) == 1 and buffer_names[0] == "model.rotary_emb.inv_freq":
@@ -894,50 +855,20 @@ def reshard_module(model: nn.Module):
 
 
 def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
-    logger = get_logger()
     language_model = get_language_model(model)
-    target_list = sorted(frozenset(ac_config.targets))
-    selective_layers = 0
-    full_layers = 0
-    fallback_layer_types: set[str] = set()
-    model_supported_targets: set[str] = set()
+    wrap_block = get_activation_checkpoint_wrapper(ac_config)
+    checkpointed_layers = 0
 
     for layer_id, (layer_name, transformer_block) in enumerate(language_model.layers.named_children()):
         if layer_id % ac_config.freq != 0:
             continue
 
-        if ac_config.mode == "selective" and supports_selective_activation_checkpointing(transformer_block):
-            model_supported_targets.update(get_supported_targets(transformer_block))
-            set_selective_activation_checkpointing(transformer_block, target_list)
-            selective_layers += 1
-        else:
-            if ac_config.mode == "selective":
-                fallback_layer_types.add(type(transformer_block).__name__)
-            transformer_block = checkpoint_wrapper(transformer_block, preserve_rng_state=False)
-            full_layers += 1
+        language_model.layers.register_module(layer_name, wrap_block(transformer_block))
+        checkpointed_layers += 1
 
-        language_model.layers.register_module(layer_name, transformer_block)
-
-    if ac_config.mode == "selective":
-        unsupported_targets = frozenset(target_list) - model_supported_targets
-        if unsupported_targets:
-            raise ValueError(
-                f"Selective activation checkpoint targets {sorted(unsupported_targets)} are not supported "
-                f"by the selected model layers. Supported targets across the model: {sorted(model_supported_targets)}"
-            )
-        if fallback_layer_types:
-            logger.warning(
-                "Selective activation checkpointing is not supported for layer types "
-                f"{sorted(fallback_layer_types)}; falling back to full checkpointing for those layers."
-            )
-        logger.info(
-            "Applied selective activation checkpointing "
-            f"(freq={ac_config.freq}, targets={target_list}, selective_layers={selective_layers}, "
-            f"full_fallback_layers={full_layers})"
-        )
-        return
-
-    logger.info(f"Applied activation checkpointing (freq={ac_config.freq})")
+    get_logger().info(
+        f"Applied {ac_config.mode} activation checkpointing to {checkpointed_layers} layers (freq={ac_config.freq})"
+    )
 
 
 def apply_compile(model: nn.Module, compile_config: CompileConfig):
@@ -945,24 +876,45 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig):
     language_model = get_language_model(model)
     for layer_id in range(len(language_model.layers)):
         # Doing it in-place avoids mangled fqn which can break checkpoint loading
-        language_model.layers[layer_id].compile(fullgraph=compile_config.fullgraph)
-    get_logger().info(f"Compiled {len(language_model.layers)} layers (fullgraph={compile_config.fullgraph})")
+        language_model.layers[layer_id].compile(fullgraph=compile_config.fullgraph, mode=compile_config.mode)
+    get_logger().info(
+        f"Compiled {len(language_model.layers)} layers (fullgraph={compile_config.fullgraph}, mode={compile_config.mode})"
+    )
 
 
-def apply_ep(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
-    language_model = get_language_model(model)
-    for transformer_block in language_model.layers:
-        block_mlp = getattr(transformer_block, "mlp", None)
-        if block_mlp is not None and isinstance(block_mlp, (MoE, LatentMoE)):
-            if config.ep_comm_backend == "torch":
-                parallelize_plan = ExpertParallel()
-            else:
-                parallelize_plan = DeepEPExpertParallel()
-            parallelize_module(
-                block_mlp.experts,
-                device_mesh=parallel_dims.get_mesh("ep"),
-                parallelize_plan=parallelize_plan,
+def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
+    """Swap dense linear modules to the configured low-precision path.
+
+    Routed-expert compute is configured independently by ``model.moe.compute``.
+    """
+    quant = config.quantization
+    if quant is None:
+        return
+
+    if isinstance(quant, FP8Config):
+        replace_linear_with_fp8_blockwise_linear(model, ignore_modules=quant.ignore_patterns)
+    elif isinstance(quant, MXFP8Config):
+        capability = torch.cuda.get_device_capability()
+        if capability[0] < 10:
+            raise ValueError(
+                f"MXFP8 quantization requires Blackwell (SM100+), but device is SM{capability[0]}{capability[1]}."
             )
+        replace_linear_with_mxfp8_linear(model, recipe=quant.recipe, ignore_modules=quant.ignore_patterns)
+
+
+def configure_trainable_parameters(model: nn.Module, config: ModelConfig) -> nn.Module | None:
+    """Apply LoRA and identify any vision encoder that must remain frozen."""
+    frozen_vision_encoder = None
+    if config.vlm is not None and config.vlm.freeze_vision_encoder:
+        frozen_vision_encoder = get_vision_encoder(model, override=config.vlm.vision_encoder_attr)
+    elif config.vlm is None:
+        frozen_vision_encoder = get_vision_encoder(model)
+        if frozen_vision_encoder is not None:
+            get_logger().info("Training a VLM checkpoint on text-only data; freezing the vision encoder")
+
+    if config.lora is not None:
+        apply_lora_to_model(model, config.lora)
+    return frozen_vision_encoder
 
 
 def _move_buffers_to_cuda(model: nn.Module, config: ModelConfig) -> None:
@@ -976,8 +928,9 @@ def _move_buffers_to_cuda(model: nn.Module, config: ModelConfig) -> None:
 
 def _reset_runtime_moe_buffers(model: nn.Module) -> None:
     for module in model.modules():
-        if isinstance(module, (MoE, LatentMoE)) and module.tokens_per_expert.device.type != "meta":
+        if isinstance(module, MoE) and module.tokens_per_expert.device.type != "meta":
             module.tokens_per_expert.zero_()
+            module.routing_confidence_sum.zero_()
 
 
 def _validate_flash_attn_4_installed() -> None:
@@ -1000,42 +953,46 @@ def _validate_flash_attn_4_installed() -> None:
         )
 
 
-def _register_fa4_attention_interface() -> None:
-    """Register a dummy `fa4` attention with transformers so AutoConfig accepts it.
+def resolve_auto_attn(config: ModelConfig) -> None:
+    """Resolve ``attn='auto'`` to a concrete flash attention implementation based on GPU architecture.
 
-    The `flash_attention_*` naming pattern triggers transformers to attempt
-    installing a kernel from the hub, so we use the short name `fa4` internally.
-    This dummy is never called because fa4 is only supported with our custom
-    model implementation.
+    FA4 on datacenter Blackwell (SM10x/SM11x, e.g. B200, B300), FA3 on Hopper (SM90), FA2
+    otherwise. FA4 is built around the tcgen05/TMEM instructions of the SM10x/SM11x families.
+    Workstation Blackwell (SM12x, e.g. RTX PRO 6000) lacks them, so it gets FA2.
     """
-    from transformers import AttentionInterface
-
-    def _noop(*args, **kwargs) -> None:
-        pass
-
-    AttentionInterface.register("fa4", _noop)
+    if config.attn != "auto":
+        return
+    major, minor = torch.cuda.get_device_capability()
+    if major in (10, 11):
+        resolved = "flash_attention_4"
+    elif major == 9:
+        resolved = "flash_attention_3"
+    else:
+        resolved = "flash_attention_2"
+    logger = get_logger()
+    logger.info(f"Auto-resolved attn='auto' to '{resolved}' (SM{major}{minor})")
+    config.attn = resolved
 
 
 def setup_model(
     config: ModelConfig,
     parallel_dims: ParallelDims,
     loading_from_checkpoint_later: bool = False,
-    fused_cross_entropy: bool | str = False,
 ) -> nn.Module:
+    resolve_auto_attn(config)
+
     if config.attn == "flash_attention_3" and not is_flash_attn_3_available():
         raise ValueError(
             "Flash attention 3 is only supported if the flash_attn_3 package is installed. Install with `uv pip install 'flash-attn-3 @ git+https://github.com/Dao-AILab/flash-attention.git@main#subdirectory=hopper' --no-build-isolation`"
         )
 
-    if config.attn == "fa4":
+    if config.attn == "flash_attention_4":
         _validate_flash_attn_4_installed()
-        _register_fa4_attention_interface()
 
     logger = get_logger()
 
     # 1. We load to meta device by default
     model = get_model(config, device=torch.device("meta"), dtype=DTYPE_MAP[config.optimization_dtype])
-    configure_moe_ep_backend(model, config)
 
     possible_to_load_to_meta = can_reinit_empty_buffers(model)
 
@@ -1048,33 +1005,49 @@ def setup_model(
     if not possible_to_load_to_meta:
         logger.warning("Cannot load model to meta device only, loading to CPU instead.")
         model = get_model(config, device=torch.device("cpu"), dtype=DTYPE_MAP[config.optimization_dtype])
-        configure_moe_ep_backend(model, config)
+
+    if config.fusions.enabled and config.lora is not None:
+        logger.warning("Skipping runtime model fusions because LoRA targets the unfused projections")
+    elif config.fusions.enabled:
+        applied = apply_model_fusions(model, config.fusions.enabled, raise_on_fail=config.fusions.raise_on_fail)
+        logger.info(f"Applied runtime model fusions: {applied}")
 
     lm_head_chunk_size: int | None = None
     if isinstance(config.fused_lm_head_token_chunk_size, int):
         lm_head_chunk_size = config.fused_lm_head_token_chunk_size
 
-    inject_prime_lm_head(model, chunk_size=lm_head_chunk_size, fused_cross_entropy=fused_cross_entropy)
+    inject_prime_lm_head(model, chunk_size=lm_head_chunk_size)
 
-    if config.fp8:
-        replace_linear_with_fp8_blockwise_linear(model)
+    apply_quantization(model, config)
 
-    # Apply LoRA before FSDP setup
-    if config.lora is not None:
-        apply_lora_to_model(model, config.lora)
+    frozen_vision_encoder = configure_trainable_parameters(model, config)
 
     if config.freeze_moe_router:
         freeze_moe_router(model)
 
+    if config.moe_router_dtype == "float32":
+        apply_fp32_moe_router(model)
+
+    # A sparse-attention indexer runs its forward under torch.no_grad(), so it is never
+    # trainable. Freeze it so optimizer state stays symmetric across checkpoint save/resume.
+    # No-op for models without a sparse indexer.
+    freeze_sparse_indexer(model)
+
     if config.debug.force_balanced_routing:
         apply_force_balanced_routing(model)
 
+    configure_moe_runtime(model, config, parallel_dims)
     if parallel_dims.ep_enabled:
-        apply_ep(model, config, parallel_dims)
         # EP replaces params with DTensors that default to requires_grad=True,
         # re-freeze base params that LoRA froze earlier.
         if config.lora is not None:
             freeze_all_except_lora_and_specified(model, config.lora)
+
+    if frozen_vision_encoder is not None:
+        freeze_vision_encoder(
+            model,
+            override_attr=config.vlm.vision_encoder_attr if config.vlm is not None else None,
+        )
 
     # the right order is AC -> Compile -> FSDP
     if config.ac is not None:
@@ -1118,40 +1091,47 @@ def forward(
     model: nn.Module,
     input_ids: Int[Tensor, "batch seq"],
     position_ids: Int[Tensor, "batch seq"],
+    *,
+    seq_lens: Int[Tensor, "segments"],
     labels: Int[Tensor, "batch seq"] | None = None,
     temperature: Tensor | None = None,
     routed_experts: Int[Tensor, "batch seq layers topk"] | None = None,
-    # Generic multimodal kwargs (e.g. {"pixel_values": ...,
-    # "image_grid_thw": ...} for Qwen3-VL; just {"pixel_values": ...}
-    # for Gemma3). Passed straight through to ``model(**kwargs)`` so
-    # the model's HF forward signature is the schema. ``mm_token_type_ids``
-    # is split out because it's prime-rl-computed (from token ids),
-    # not a renderer/processor output.
+    sampling_mask: Int[Tensor, "batch seq mask"] | None = None,
     mm_kwargs: dict[str, Tensor] | None = None,
+    mm_forward_policy: ForwardPolicy | None = None,
     mm_token_type_ids: Int[Tensor, "batch seq"] | None = None,
+    # True when seq_lens holds the full pre-CP-shard document boundaries
+    # (kept global because documents can straddle the shard cut).
+    seq_lens_are_pre_shard: bool = False,
 ) -> PrimeLmOutput:
-    # Build kwargs for model forward
     kwargs = {
         "input_ids": input_ids,
         "labels": labels,
         "temperature": temperature,
     }
 
+    # Sampling masks are consumed by the injected prime lm_head; HF
+    # forwards don't know the kwarg, so only pass it when present.
+    if sampling_mask is not None:
+        kwargs["sampling_mask"] = sampling_mask
+
     if mm_kwargs:
-        # Forward the per-model multimodal tensors verbatim, plus the
-        # renderer-supplied ``mm_token_type_ids`` (renderer owns the
-        # token→modality mapping via ``mm_token_type_id_map``).
         kwargs.update(mm_kwargs)
         if mm_token_type_ids is not None:
             kwargs["mm_token_type_ids"] = mm_token_type_ids
-        # ``position_ids`` for MRoPE families: Qwen3-VL's HF forward
-        # recomputes 3D positions from ``image_grid_thw`` and breaks if
-        # given the trainer's pre-computed 1D ``position_ids``. Detect
-        # via the mm_kwargs shape so we don't enumerate model_types.
-        if "image_grid_thw" not in mm_kwargs:
+        # SFT still uses its existing eager processor path and does not provide
+        # an adapter policy yet, so preserve its current kwargs-based behavior.
+        policy = mm_forward_policy or ForwardPolicy(pass_position_ids="image_grid_thw" not in mm_kwargs)
+        if policy.requires_mm_token_type_ids and mm_token_type_ids is None:
+            raise ValueError("Multimodal forward policy requires mm_token_type_ids")
+        if policy.pass_position_ids:
             kwargs["position_ids"] = position_ids
     else:
         kwargs["position_ids"] = position_ids
+
+    if isinstance(model, PreTrainedModelPrimeRL):
+        kwargs["seq_lens"] = seq_lens
+        kwargs["seq_lens_are_pre_shard"] = seq_lens_are_pre_shard
 
     if routed_experts is not None:
         kwargs["routed_experts"] = routed_experts

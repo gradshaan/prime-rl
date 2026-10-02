@@ -17,6 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from dataclasses import dataclass
 from functools import cached_property
 
@@ -25,7 +26,7 @@ from torch._utils import _get_available_device_type
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from prime_rl.configs.trainer import ModelConfig
-from prime_rl.utils.logger import get_logger
+from prime_rl.utils.logger import format_time, get_logger
 
 device_type = _get_available_device_type() or "cuda"
 
@@ -105,7 +106,9 @@ class ParallelDims:
                 names.append(name)
 
         self.logger.info(f"Building {len(dims)}-D device mesh with {names}, {dims}")
+        t0 = time.perf_counter()
         mesh = init_device_mesh(device_type, dims, mesh_dim_names=names)
+        self.logger.debug(f"Built device mesh in {format_time(time.perf_counter() - t0)}")
 
         # Create all the submesh here to ensure all required process groups are
         # initialized:
@@ -163,7 +166,9 @@ class ParallelDims:
                 names.append(name)
 
         self.logger.info(f"Building {len(dims)}-D device mesh with {names}, {dims}")
+        t0 = time.perf_counter()
         mesh = init_device_mesh(device_type, dims, mesh_dim_names=names)
+        self.logger.debug(f"Built device mesh in {format_time(time.perf_counter() - t0)}")
 
         # Create all the submesh here to ensure all required process groups are
         # initialized:
@@ -270,7 +275,52 @@ class ParallelDims:
         return get_logger()
 
 
+def _is_moe_model(config: ModelConfig) -> bool:
+    """Return True if the model has MoE layers, by loading its HuggingFace config."""
+    from transformers import AutoConfig
+
+    model_config = AutoConfig.from_pretrained(config.name, trust_remote_code=config.trust_remote_code)
+    model_config = getattr(model_config, "text_config", model_config)
+    return hasattr(model_config, "num_experts") or hasattr(model_config, "n_routed_experts")
+
+
+def resolve_ep(config: ModelConfig) -> None:
+    """Resolve ``ep="auto"`` in-place to a concrete integer.
+
+    For MoE models, resolves to ``min(fsdp_island_size, 8)`` where
+    ``fsdp_island_size = world_size // dp_replicate``. For non-MoE
+    models, resolves to 1 (no-op).
+    """
+    if config.ep != "auto":
+        return
+
+    # EP requires the custom implementation; skip auto-resolution for HF impl
+    if config.impl not in ("custom", "auto"):
+        config.ep = 1
+        get_logger().info(f"EP auto: impl='{config.impl}' does not support EP, resolving ep=1")
+        return
+
+    world_size = dist.get_world_size()
+
+    if not _is_moe_model(config):
+        config.ep = 1
+        get_logger().info("EP auto: model is not MoE, resolving ep=1")
+        return
+
+    dp_replicate = config.dp_replicate
+    fsdp_island_size = world_size // dp_replicate  # pp is always 1
+    resolved_ep = min(fsdp_island_size, 8)
+
+    config.ep = resolved_ep
+    get_logger().info(f"EP auto: world_size={world_size}, dp_replicate={dp_replicate} -> resolved ep={resolved_ep}")
+
+
 def get_parallel_dims(config: ModelConfig, seq_len: int | None = None) -> ParallelDims:
+    assert isinstance(config.ep, int), (
+        f"config.ep must be resolved to an int before get_parallel_dims; got {config.ep!r}. "
+        "Call resolve_ep(config) first."
+    )
+
     # Initialize parallel dimensions
     parallel_dims = ParallelDims(
         dp_replicate=config.dp_replicate,
