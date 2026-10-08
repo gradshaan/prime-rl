@@ -34,8 +34,7 @@ extra_body = { enable_thinking = true }
 [[orchestrator.env]]
 id = "phy-env"
 name = "phy-rl"
-# All reliable sources; phybench and image questions filtered automatically.
-# To restrict: args = { sources = "olympiadbench_physics,ipho_open_train" }
+args = { dataset_path = "examples/phy_rl/data_pipeline/data/final/v3/train.jsonl", dev_path = "examples/phy_rl/data_pipeline/data/final/v3/dev.jsonl" }
 
 [orchestrator.eval]
 interval = 50
@@ -43,6 +42,7 @@ interval = 50
 [[orchestrator.eval.env]]
 id = "phy-env"
 name = "phy-rl-eval"
+args = { dataset_path = "examples/phy_rl/data_pipeline/data/final/v3/train.jsonl", dev_path = "examples/phy_rl/data_pipeline/data/final/v3/dev.jsonl" }
 
 [trainer.model]
 impl = "auto"

@@ -16,7 +16,7 @@ from .answer_extraction import (
     top_answerish_proposals,
 )
 from .filters import admissibility_rejection
-from .gemini_judge import candidate_row_for_judge, judge_subproblems_with_gemini
+from .gemini_judge import audit_judged_rows_with_gemini, candidate_row_for_judge, judge_subproblems_with_gemini
 from .io import read_jsonl, write_jsonl
 from .schema import Answer, FinalItem, RejectedItem, answer_from_dict, final_item_from_dict, to_dict
 from .verifiers import verify_answer
@@ -34,6 +34,13 @@ UNVERIFIABLE_RE = re.compile(
     r"\b(explain|discuss|comment|describe qualitatively|sketch|draw|plot|prove|show that)\b",
     flags=re.IGNORECASE,
 )
+OUTPUT_QUANTITIES_RE = re.compile(
+    r"\b(acceleration|velocity|speed|displacement|position|distance|tension|force|work|energy|power|"
+    r"momentum|impulse|mass|radius|period|frequency|wavelength|phase|amplitude|current|charge|"
+    r"potential|voltage|resistance|field|flux|temperature|pressure|volume|entropy|efficiency|"
+    r"coefficient of friction|angular frequency|angular momentum)\b",
+    re.IGNORECASE,
+)
 
 
 def build_rlvr_subproblems(
@@ -44,6 +51,7 @@ def build_rlvr_subproblems(
     *,
     min_score: int = 3,
     judge_model: str | None = None,
+    audit_model: str | None = None,
 ) -> tuple[int, int, int]:
     verified: list[dict[str, Any]] = []
     review: list[dict[str, Any]] = []
@@ -63,6 +71,7 @@ def build_rlvr_subproblems(
                 subquestions,
                 solution_blocks,
                 judge_model=judge_model,
+                audit_model=audit_model,
             )
             verified.extend(judged_verified)
             review.extend(judged_review)
@@ -127,6 +136,7 @@ def _build_judged_parent_rows(
     solution_blocks: dict[str, tuple[str, str]],
     *,
     judge_model: str,
+    audit_model: str | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     candidate_items = []
     candidate_rows = []
@@ -152,6 +162,32 @@ def _build_judged_parent_rows(
         review.append(_judged_review(parent, {}, "judge_failed", detail=str(exc)))
         return verified, review, rejected
 
+    if audit_model is None:
+        review.append(_judged_review(parent, {}, "independent_audit_not_configured"))
+        return verified, review, rejected
+    try:
+        expected_id_list = [
+            normalize_subproblem_id(row["subproblem_id"]) if row.get("subproblem_id") else None
+            for row in candidate_rows
+        ]
+        expected_ids = set(expected_id_list)
+        judged_ids = {
+            normalize_subproblem_id(row["subproblem_id"]) if isinstance(row.get("subproblem_id"), str) else None
+            for row in judged_rows
+        }
+        if len(expected_ids) != len(expected_id_list) or len(judged_ids) != len(judged_rows) or judged_ids != expected_ids:
+            review.append(_judged_review(parent, {}, "judge_output_coverage_mismatch"))
+            return verified, review, rejected
+        audit_rows = audit_judged_rows_with_gemini(
+            parent,
+            judged_rows,
+            candidate_rows,
+            model_name=audit_model,
+        )
+    except (RuntimeError, ValueError) as exc:
+        review.append(_judged_review(parent, {}, "independent_audit_failed", detail=str(exc)))
+        return verified, review, rejected
+
     for judged in judged_rows:
         subproblem_id = judged.get("subproblem_id")
         if isinstance(subproblem_id, str):
@@ -168,7 +204,26 @@ def _build_judged_parent_rows(
             review.append(_judged_review(template, judged, "judge_rejected"))
             continue
 
-        answers = [_judged_answer(answer, subproblem_id) for answer in judged.get("answers", [])]
+        if not isinstance(judged.get("answers"), list) or not all(
+            isinstance(answer, dict) for answer in judged["answers"]
+        ):
+            review.append(_judged_review(template, judged, "malformed_judge_answers"))
+            continue
+        audit = audit_rows.get(subproblem_id)
+        if audit is None or not audit["approved"]:
+            review.append(
+                _judged_review(
+                    template,
+                    judged,
+                    "independent_audit_rejected",
+                    detail=str(audit.get("reason", "audit did not approve")) if audit else "missing audit result",
+                )
+            )
+            continue
+        answers = [
+            _judged_answer(answer, subproblem_id, index, len(judged["answers"]))
+            for index, answer in enumerate(judged["answers"], start=1)
+        ]
         admitted = _judged_item(template, judged, answers, subproblem_id=subproblem_id)
         unsafe_answers = [answer for answer in admitted.answers if not _is_verifier_safe_answer(answer)]
         if unsafe_answers:
@@ -187,9 +242,32 @@ def _build_judged_parent_rows(
     return verified, review, rejected
 
 
-def _judged_answer(raw: dict[str, Any], subproblem_id: str | None) -> Answer:
+def _judged_answer(raw: dict[str, Any], subproblem_id: str | None, index: int, total: int) -> Answer:
     answer = answer_from_dict(raw)
-    return replace(answer, subproblem_id=subproblem_id)
+    label = raw.get("label") or raw.get("output_label") or (
+        subproblem_id if total == 1 and subproblem_id else f"output_{index}"
+    )
+    if answer.answer_type in {"numeric", "numerical"}:
+        return replace(
+            answer,
+            label=label,
+            subproblem_id=subproblem_id,
+            tolerance=None,
+            atol=_answer_atol(answer.value),
+            rtol=1e-6,
+        )
+    return replace(answer, label=label, subproblem_id=subproblem_id)
+
+
+def _answer_atol(value: str) -> float:
+    cleaned = re.sub(r"\\(?:text|mathrm|mbox)\{([^{}]*)\}", r"\1", value)
+    match = re.fullmatch(
+        r"\s*[+-]?(?P<int>\d+)(?:\.(?P<frac>\d+))?\s*(?:\\times\s*10\^\{?(?P<exp>[+-]?\d+)\}?)?\s*",
+        cleaned,
+    )
+    if match is None or match.group("frac") is None:
+        return 0.0
+    return 0.5 * 10 ** (int(match.group("exp") or 0) - len(match.group("frac")))
 
 
 def _judged_item(
@@ -220,6 +298,9 @@ def _judged_item(
         language=template.language,
         split=template.split,
         provenance=template.provenance,
+        family_id=template.family_id,
+        topic=template.topic,
+        difficulty=template.difficulty,
     )
 
 
@@ -397,7 +478,18 @@ def _select_verifier_safe_answers(item: FinalItem, proposals: list[AnswerProposa
         key=lambda proposal: _subquestion_answer_score(item.question, proposal),
         reverse=True,
     )
-    return [proposal.answer for proposal in ranked[:limit]]
+    answers = ranked[:limit]
+    selected = []
+    for index, proposal in enumerate(answers, start=1):
+        lhs = re.match(r"^\s*([A-Za-z](?:_\{?[A-Za-z0-9,]+\}?|_[A-Za-z0-9]+)?)\s*=", proposal.answer.value)
+        lhs_label = _latex_identifier_text(lhs.group(1)) if lhs else None
+        label = (
+            (lhs_label or f"output_{index}")
+            if len(answers) > 1
+            else (proposal.answer.output_label or lhs_label or f"output_{index}")
+        )
+        selected.append(replace(proposal.answer, label=label))
+    return selected
 
 
 def _is_allowed_for_auto_admission(item: FinalItem, proposal: AnswerProposal) -> bool:
@@ -413,8 +505,8 @@ def _is_verifier_safe_answer(answer: Answer) -> bool:
         return False
     if answer.answer_type in {"string", "string_exact"}:
         return False
-    if answer.verifier in {"numeric", "sympy", "expression", "mcq", "multi_select", "set", "tuple", "interval"}:
-        return verify_answer(answer.value, answer)
+    if answer.verifier in {"numeric", "sympy", "expression"}:
+        return verify_answer({"value": answer.value, "unit": answer.unit}, answer)
     return False
 
 
@@ -423,6 +515,12 @@ def _expected_answer_count(question: str) -> int:
     explicit = len(expected_subproblem_ids(body))
     if explicit:
         return explicit
+    target_symbols = _question_target_symbols(body)
+    if len(target_symbols) > 1:
+        return min(4, len(target_symbols))
+    quantity_targets = {match.group(1).casefold() for match in OUTPUT_QUANTITIES_RE.finditer(body)}
+    if len(quantity_targets) > 1:
+        return min(4, len(quantity_targets))
     directives = len(ANSWER_DIRECTIVE_RE.findall(body))
     numeric_prompts = len(
         re.findall(
@@ -433,6 +531,12 @@ def _expected_answer_count(question: str) -> int:
     )
     if "equation of motion" in body.lower() and "angular frequency" in body.lower():
         return 2
+    directive = ANSWER_DIRECTIVE_RE.search(body)
+    if directive is not None:
+        request_clause = re.split(r"[?.;:]", body[directive.end() :], maxsplit=1)[0]
+        connectors = len(re.findall(r",|\band\b|\bas well as\b", request_clause, flags=re.I))
+        if connectors and len(quantity_targets) >= 1:
+            return min(4, max(2, connectors + 1))
     return max(1, min(4, directives, max(1, numeric_prompts))) if directives else 1
 
 

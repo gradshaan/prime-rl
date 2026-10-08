@@ -1,6 +1,13 @@
 [years]
 train_max_year = 2023
-frozen_test_years = [2024, 2025]
+release_version = "physics_rlvr_v3"
+
+[development]
+family_fraction = 0.05
+seed = 42
+
+[families]
+max_parameter_variants = 3
 
 [blocked_training]
 competitions = [
@@ -10,11 +17,29 @@ competitions = [
   "F=MA",
 ]
 sources = [
+  "Darkyy/phy-rl-base",
+  "darkyy_phy_rl_base",
+  "phy_rl_base",
+  "physics_training_release",
+  "desimfj/PHYSICS",
   "PHYSICS_test",
+  "OlympiadBench",
   "OlympiadBench_eval",
+  "phybench",
+  "PhysOlym-A",
+  "PhysCorp-A",
+  "PhysR1Corp",
+  "UGPhysics",
+  "HiPhO",
+  "PhysReason",
+  "PhyX",
+  "PhysUniBench",
+  "MMMU",
+  "MMMU-Pro",
   "JEEBench",
   "SciBench",
 ]
+dataset_repositories = ["Darkyy/phy-rl-base", "desimfj/PHYSICS"]
 
 [admissibility]
 min_problem_chars = 40
@@ -22,6 +47,5 @@ min_solution_chars = 20
 reject_if_requires_diagram = true
 
 [dedup]
-exact_text_hash = true
-exact_answer_hash = true
-ngram_jaccard_threshold = 0.92
+exact_prompt_hash = true
+conflicting_duplicate_answers = "reject"

@@ -1,291 +1,203 @@
-"""
-Physics RLVR environment for prime-rl.
+"""English, text-only physics RLVR environment using the v3 data contract."""
 
-Loads the Darkyy/phy-rl-base dataset, filters invalid examples, and trains
-a model to solve physics problems using binary/fractional correctness reward.
+from __future__ import annotations
 
-Reward design:
-- Reward = correct_sub_answers / total_sub_answers  (fractional for multi-part)
-- A sub-answer is correct if the model's \boxed{...} content matches the ground
-  truth within 5% relative tolerance (numerical) or symbolic equality (expression).
-- No format bonus — the gradient signal comes entirely from correctness.
-"""
-
+import hashlib
 import json
 import os
 import random
 import re
+from pathlib import Path
 from typing import Any
 
 import verifiers as vf
 from datasets import Dataset, load_dataset
-
-# ---------------------------------------------------------------------------
-# System prompt — guides physics CoT and enforces \boxed{} output format
-# ---------------------------------------------------------------------------
-
-SYSTEM_PROMPT = """\
-You are an expert physics problem solver with deep knowledge of classical \
-mechanics, electromagnetism, thermodynamics, statistical mechanics, quantum \
-mechanics, optics, and special relativity.
-
-Approach every problem as follows:
-1. **Identify** the relevant physical domain, principles, and governing equations.
-2. **Define** all variables, coordinate systems, and approximations explicitly.
-3. **Derive** the solution step by step, showing key algebraic and calculus steps.
-4. **Verify** units and check limiting cases where possible.
-5. **State** the final answer clearly.
-
-Answer format rules:
-- Always enclose your final answer(s) in \\boxed{}.
-- For multi-part problems (a, b, c, …), provide one box per part in order:
-  \\boxed{<answer_a>} for part (a), \\boxed{<answer_b>} for part (b), etc.
-- Include units inside the box when the answer is a physical quantity:
-  \\boxed{9.8\\,\\text{m/s}^2}, \\boxed{2.4\\times10^{-3}\\,\\text{kg}}.
-- For symbolic answers: \\boxed{\\dfrac{mv^2}{r}}.
-- For dimensionless numbers: \\boxed{3.14}.
-
-Failure to place your answer in \\boxed{} will result in zero credit.\
-"""
-
-# ---------------------------------------------------------------------------
-# Answer extraction
-# ---------------------------------------------------------------------------
-
-_SCIENTIFIC_RE = re.compile(
-    r"^(-?)\s*(\d+(?:\.\d+)?)\s*(?:\\times|×)\s*10\^{?(-?\d+)}?$"
+from physics_rlvr_common import (
+    SYSTEM_PROMPT,
+    task_prompt,
+    validate_answer,
+    validate_release_state,
+    validate_training_policy,
+    verify_prediction,
 )
+from physics_rlvr_common.verifier import answer_from_dict
+
+DEFAULT_TRAIN_PATH = Path(__file__).parents[2] / "data_pipeline/data/final/v3/train.jsonl"
 
 
-def _extract_boxed(text: str) -> list[str]:
-    """Return all \\boxed{...} contents from *text*, handling nested braces."""
-    results: list[str] = []
-    i = 0
-    while i < len(text):
-        idx = text.find(r"\boxed{", i)
-        if idx == -1:
-            break
-        start = idx + 7  # len(r"\boxed{")
-        depth = 1
-        j = start
-        while j < len(text) and depth > 0:
-            if text[j] == "{":
-                depth += 1
-            elif text[j] == "}":
-                depth -= 1
-            j += 1
-        if depth == 0:
-            results.append(text[start : j - 1])
-        i = idx + 1
-    return results
-
-
-def _parse_number(s: str) -> float | None:
-    """Parse a LaTeX numeric expression to float, returning None on failure."""
-    s = s.strip()
-    # Strip non-numeric LaTeX wrappers (units, text, etc.)
-    s = re.sub(r"\\(?:text|mathrm|mbox)\{[^}]*\}", "", s).strip()
-    # Strip trailing/leading commas or spaces that sometimes appear
-    s = s.strip(",").strip()
-
-    try:
-        return float(s)
-    except ValueError:
-        pass
-
-    # Handle \times 10^{n} / \times 10^n (scientific notation)
-    m = _SCIENTIFIC_RE.match(s)
-    if m:
-        sign_str, mantissa_str, exp_str = m.groups()
-        sign = -1.0 if sign_str == "-" else 1.0
-        return sign * float(mantissa_str) * 10 ** int(exp_str)
-
-    # Sympy as last resort (handles \frac, \sqrt, \pi, etc.)
-    try:
-        from sympy.parsing.latex import parse_latex  # noqa: PLC0415
-
-        result = float(parse_latex(s).evalf())
-        if result != result:  # NaN guard
-            return None
-        return result
-    except Exception:
-        pass
-
-    return None
-
-
-def _numbers_match(a: float, b: float, rtol: float = 0.05) -> bool:
-    """True if |a-b|/|b| ≤ rtol (or both near-zero)."""
-    if b == 0.0:
-        return abs(a) < 1e-10
-    return abs(a - b) / abs(b) <= rtol
-
-
-def _expressions_match(expr1: str, expr2: str) -> bool:
-    """Symbolically compare two LaTeX expressions via sympy."""
-    try:
-        from sympy import simplify  # noqa: PLC0415
-        from sympy.parsing.latex import parse_latex  # noqa: PLC0415
-
-        e1 = parse_latex(expr1)
-        e2 = parse_latex(expr2)
-        return bool(simplify(e1 - e2) == 0)
-    except Exception:
-        pass
-    return expr1.strip() == expr2.strip()
-
-
-def _check_answer(model_ans: str, expected_value: str, answer_type: str) -> bool:
-    """Return True if *model_ans* matches *expected_value* for *answer_type*."""
-    model_ans = model_ans.strip()
-    expected_value = expected_value.strip()
-
-    if answer_type in ("numerical", "text"):
-        model_num = _parse_number(model_ans)
-        expected_num = _parse_number(expected_value)
-        if model_num is not None and expected_num is not None:
-            return _numbers_match(model_num, expected_num)
-        # Fall back to case-insensitive string match
-        return model_ans.lower() == expected_value.lower()
-
-    if answer_type == "expression":
-        return _expressions_match(model_ans, expected_value)
-
-    # Unknown type: string fallback
-    return model_ans.lower() == expected_value.lower()
-
-
-# ---------------------------------------------------------------------------
-# Reward function
-# ---------------------------------------------------------------------------
-
-
-def correctness_reward(completion: list[dict], answer: str, **kwargs) -> float:
-    """
-    Fractional correctness reward in [0.0, 1.0].
-
-    Extracts all \\boxed{} answers from the model's completion and checks how
-    many of the expected sub-answers are matched.  Returns correct / total.
-    """
-    # Extract assistant text (last assistant message in completion)
-    text = ""
-    for msg in reversed(completion):
-        if msg.get("role") == "assistant":
-            text = msg.get("content", "")
-            break
-
-    model_boxed = _extract_boxed(text)
-
-    try:
-        expected: list[dict[str, Any]] = json.loads(answer)
-    except (json.JSONDecodeError, TypeError):
-        return 0.0
-
-    if not expected or not model_boxed:
-        return 0.0
-
-    correct = sum(
-        1
-        for sa in expected
-        if any(
-            _check_answer(m, sa["value"], sa["answer_type"]) for m in model_boxed
-        )
+def correctness_reward(completion: list[dict[str, Any]], answer: str, **kwargs: Any) -> float:
+    assistant_text = next(
+        (message.get("content", "") for message in reversed(completion) if message.get("role") == "assistant"),
+        "",
     )
-    return correct / len(expected)
+    if not isinstance(assistant_text, str):
+        return 0.0
+    expected = [answer_from_dict(raw) for raw in json.loads(answer)]
+    if any(validate_answer(item, require_label=True) for item in expected):
+        raise ValueError("environment received malformed verifier targets")
+    return verify_prediction(assistant_text, expected)
 
 
-# ---------------------------------------------------------------------------
-# Dataset helpers
-# ---------------------------------------------------------------------------
-
-# Sources where the `value` field is a reliable ground-truth (not a placeholder).
-# phybench always has value="2" regardless of the actual answer.
-_UNRELIABLE_SOURCES = {"phybench"}
-
-_IMAGE_RE = re.compile(r"<image_start>|\[problem_image")
-
-
-def _is_valid(row: dict[str, Any], sources: list[str] | None) -> bool:
-    if row["source"] in _UNRELIABLE_SOURCES:
-        return False
-    if _IMAGE_RE.search(row["question"]):
-        return False
-    if sources and row["source"] not in sources:
-        return False
-    sa = row.get("structured_answers") or []
-    if not sa:
-        return False
-    # Skip examples where every sub-answer has a suspiciously trivial value,
-    # which often indicates placeholder data in physics_text_reasoning_train.
-    if all(s.get("value", "").strip() in ("2", "") for s in sa):
-        return False
-    return True
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows = []
+    with path.open(encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            if line.strip():
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"{path}:{line_number} is invalid JSONL") from exc
+                if not isinstance(row, dict):
+                    raise ValueError(f"{path}:{line_number} must contain a JSON object")
+                rows.append(row)
+    return rows
 
 
-def _to_verifiers_row(row: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "question": row["question"],
-        "answer": json.dumps(row["structured_answers"]),
-    }
+def _validated_rows(
+    rows: list[dict[str, Any]],
+    *,
+    split: str,
+    sources: list[str] | None,
+) -> list[dict[str, Any]]:
+    selected = []
+    for row in rows:
+        validate_release_state(row)
+        if row.get("dataset_version") != "physics_rlvr_v3":
+            raise ValueError("environment accepts only physics_rlvr_v3 records")
+        answers = row.get("answers")
+        if not isinstance(answers, list) or not answers:
+            raise ValueError(f"{row.get('problem_id', '<unknown>')} has no answers")
+        parsed_answers = [answer_from_dict(answer) for answer in answers]
+        if any(validate_answer(answer, require_label=True) for answer in parsed_answers):
+            raise ValueError(f"{row.get('problem_id', '<unknown>')} has malformed verifier targets")
+        source = row["source"]
+        validate_training_policy(
+            source=source,
+            competition=row["competition"],
+            year=row.get("year"),
+            split=row["split"],
+            source_split=row.get("provenance", {}).get("source_split"),
+            source_revision=row.get("provenance", {}).get("source_revision"),
+        )
+        if sources and source not in sources:
+            continue
+        if row["split"] != split:
+            raise ValueError(f"{row['problem_id']} is in the {row['split']} split, expected {split}")
+        labels = [answer.output_label for answer in parsed_answers]
+        if any(not label for label in labels) or len(labels) != len(set(labels)):
+            raise ValueError(f"{row['problem_id']} must have unique labels for every answer")
+        question = "\n\n".join(part for part in [row.get("shared_context", ""), row["question"]] if part).strip()
+        if not question or "<image_start>" in question or "[problem_image" in question.lower():
+            raise ValueError(f"{row['problem_id']} is not a complete text-only question")
+        if "the solution is:" in question.casefold():
+            raise ValueError(f"{row['problem_id']} includes its solution in the prompt")
+        selected.append(row)
+    return selected
 
 
-# ---------------------------------------------------------------------------
-# Environment entry point
-# ---------------------------------------------------------------------------
+def _to_verifiers_row(row: dict[str, Any]) -> dict[str, str]:
+    answers = [
+        {
+            "label": answer.get("label") or answer.get("output_label"),
+            "value": answer["value"],
+            "unit": answer.get("unit"),
+            "answer_type": answer["answer_type"],
+            "verifier": answer["verifier"],
+            "atol": answer.get("atol"),
+            "rtol": answer.get("rtol", answer.get("tolerance")),
+            "equivalent_forms": answer.get("equivalent_forms", []),
+            "assumptions": answer.get("assumptions", []),
+        }
+        for answer in row["answers"]
+    ]
+    prompt = task_prompt(row.get("shared_context", ""), row["question"], [answer["label"] for answer in answers])
+    return {"question": prompt, "answer": json.dumps(answers)}
 
 
 def load_environment(
+    *,
+    dataset_path: str | Path | None = None,
+    dev_path: str | Path | None = None,
+    dataset_name: str | None = None,
+    dataset_revision: str | None = None,
     hf_token: str | None = None,
     sources: str | list[str] | None = None,
     num_train: int | None = None,
-    num_eval: int = 100,
     seed: int = 42,
-    **kwargs,
+    **kwargs: Any,
 ) -> vf.Environment:
-    """
-    Build and return the physics SingleTurnEnv.
-
-    Args:
-        hf_token:  HuggingFace token.  Falls back to HF_TOKEN /
-                   HUGGING_FACE_HUB_TOKEN environment variables.
-        sources:   Comma-separated source name(s) or list of source names to
-                   include.  None = all reliable sources.
-        num_train: Max training examples.  None = all available.
-        num_eval:  Evaluation set size (drawn before train split).
-        seed:      Random seed for shuffling.
-    """
-    token = (
-        hf_token
-        or os.environ.get("HF_TOKEN")
-        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    )
-
-    # Normalise sources: accept comma-separated string or list
+    if dataset_path is not None and dataset_name is not None:
+        raise ValueError("set either dataset_path or dataset_name, not both")
+    if dataset_path is None and dataset_name is None:
+        dataset_path = DEFAULT_TRAIN_PATH
+    token = hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     if isinstance(sources, str):
-        sources = [s.strip() for s in sources.split(",") if s.strip()]
-    if not sources:
-        sources = None
+        sources = [source.strip() for source in sources.split(",") if source.strip()]
+    allowed_sources = set(sources) if sources else None
+    if num_train is not None and num_train < 0:
+        raise ValueError("num_train must be non-negative")
 
-    raw = load_dataset("Darkyy/phy-rl-base", token=token)["train"]
-    valid = [row for row in raw if _is_valid(row, sources)]
+    if dataset_path is not None:
+        train_file = Path(dataset_path)
+        metadata_path = train_file.parent / "metadata.json"
+        with metadata_path.open(encoding="utf-8") as file:
+            metadata = json.load(file)
+        if metadata.get("dataset_version") != "physics_rlvr_v3":
+            raise ValueError(f"{metadata_path} is not a v3 dataset manifest")
+        _validate_local_artifact(train_file, metadata, "train")
+        train_rows = _validated_rows(_read_jsonl(train_file), split="train", sources=allowed_sources)
+    else:
+        if dataset_revision is None or re.fullmatch(r"[0-9a-f]{40}", dataset_revision) is None:
+            raise ValueError("dataset_revision must be an exact 40-character Hugging Face commit hash")
+        train_dataset = load_dataset(
+            dataset_name,
+            revision=dataset_revision,
+            split="train",
+            token=token,
+        )
+        train_rows = _validated_rows(list(train_dataset), split="train", sources=allowed_sources)
 
-    rng = random.Random(seed)
-    rng.shuffle(valid)
-
-    # Eval comes first so it's deterministic regardless of num_train
-    eval_take = min(num_eval, max(1, len(valid) // 5))
-    eval_rows = valid[:eval_take]
-    train_rows = valid[eval_take:]
+    random.Random(seed).shuffle(train_rows)
     if num_train is not None:
         train_rows = train_rows[:num_train]
+    if not train_rows:
+        raise ValueError("no training rows remain after policy and source filtering")
 
-    train_ds = Dataset.from_list([_to_verifiers_row(r) for r in train_rows])
-    eval_ds = Dataset.from_list([_to_verifiers_row(r) for r in eval_rows])
+    dev_dataset = None
+    if dev_path is not None:
+        dev_file = Path(dev_path)
+        if dataset_path is not None and dev_file.parent != Path(dataset_path).parent:
+            raise ValueError("train and development data must come from the same v3 artifact directory")
+        dev_metadata_path = dev_file.parent / "metadata.json"
+        if dataset_path is None:
+            with dev_metadata_path.open(encoding="utf-8") as file:
+                dev_metadata = json.load(file)
+            if dev_metadata.get("dataset_version") != "physics_rlvr_v3":
+                raise ValueError(f"{dev_metadata_path} is not a v3 dataset manifest")
+        else:
+            dev_metadata = metadata
+        _validate_local_artifact(dev_file, dev_metadata, "dev")
+        dev_rows = _validated_rows(_read_jsonl(dev_file), split="dev", sources=allowed_sources)
+        if not dev_rows:
+            raise ValueError("no development rows remain after policy and source filtering")
+        dev_dataset = Dataset.from_list([_to_verifiers_row(row) for row in dev_rows])
 
-    rubric = vf.Rubric(funcs=[correctness_reward], weights=[1.0])
     return vf.SingleTurnEnv(
-        dataset=train_ds,
-        eval_dataset=eval_ds,
+        dataset=Dataset.from_list([_to_verifiers_row(row) for row in train_rows]),
+        eval_dataset=dev_dataset,
         system_prompt=SYSTEM_PROMPT,
-        rubric=rubric,
+        rubric=vf.Rubric(funcs=[correctness_reward], weights=[1.0]),
     )
+
+
+def _validate_local_artifact(path: Path, metadata: dict[str, Any], split: str) -> None:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    expected_count = metadata.get("counts", {}).get(split)
+    rows = _read_jsonl(path)
+    if not isinstance(expected_count, int) or expected_count != len(rows):
+        raise ValueError(f"{path} row count does not match its metadata")
+    expected_hash = metadata.get("file_sha256", {}).get(path.name)
+    actual_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    if expected_hash is None or expected_hash != actual_hash:
+        raise ValueError(f"{path} checksum does not match its metadata")
