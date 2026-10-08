@@ -172,6 +172,7 @@ members = [
     "deps/verifiers/environments/reverse_text",
     "deps/verifiers/environments/wiki_search",
     "deps/verifiers/environments/wordle",
+    "examples/phy_rl/phy_env",
 ]
 # Tau tasksets require litellm<1.82.7, while Harbor requires litellm>=1.92.0.
 # Apex pins a verifiers git revision instead of the editable workspace member.

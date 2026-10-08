@@ -1,60 +1,62 @@
-# Full RLVR training — Qwen/Qwen3-4B on phy-rl-base, 4× H100 80 GB.
-# Run:
-#   HF_TOKEN=<token> uv run rl @ examples/phy_rl/rl.toml \
-#     --wandb.project phy-rl --wandb.name phy-rl-qwen3-4b-<date>
+# RLVR on verifiable physics: Qwen/Qwen3-4B, 2 trainer GPUs + 4 inference GPUs.
+#   uv sync --all-extras --package prime-rl --package phy-env
+#   uv run rl @ examples/phy_rl/rl.toml --run.name phy-rl-qwen3-4b
 
 max_steps = 500
-seq_len = 16384
-
-[wandb]
-project = "phy-rl"
-name = "phy-rl-qwen3-4b"
-
-[deployment]
-num_train_gpus = 2
-num_infer_gpus = 2
-
-[ckpt]  # save final weights
+seq_len = 20480
 
 [model]
 name = "Qwen/Qwen3-4B"
 
+[deployment]
+num_train_gpus = 2
+num_infer_gpus = 4
+
+[monitors.wandb]
+project = "phy-rl"
+
+[ckpt]
+interval = 50
+
 [orchestrator]
-# 128 rollouts / 8 per example = 16 unique problems per step
-batch_size = 128
-rollouts_per_example = 8
+batch_size = 256 # 16 problems x 16 rollouts
 
-[orchestrator.sampling]
-max_tokens = 8192
-temperature = 0.7
-# Qwen3 thinking mode — enable for deeper chain-of-thought reasoning.
-# Remove if your vLLM build does not support enable_thinking for this model.
-extra_body = { enable_thinking = true }
+[orchestrator.train]
+group_size = 16
 
-[[orchestrator.env]]
-id = "phy-env"
-name = "phy-rl"
-args = { dataset_path = "examples/phy_rl/data_pipeline/data/final/v3/train.jsonl", dev_path = "examples/phy_rl/data_pipeline/data/final/v3/dev.jsonl" }
+[orchestrator.train.sampling]
+# Qwen3-8B used about 7k tokens on the median problem and 40% of replies went past 8k
+max_completion_tokens = 16384
+
+[[orchestrator.train.source]]
+name = "phy-train"
+select.shuffle = true # rows are grouped by problem family
+env.taskset.id = "phy-env"
+env.taskset.split = "train"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
 
 [orchestrator.eval]
 interval = 50
 
-[[orchestrator.eval.env]]
-id = "phy-env"
-name = "phy-rl-eval"
-args = { dataset_path = "examples/phy_rl/data_pipeline/data/final/v3/train.jsonl", dev_path = "examples/phy_rl/data_pipeline/data/final/v3/dev.jsonl" }
+[orchestrator.eval.sampling]
+max_completion_tokens = 16384
+temperature = 0.6
+top_p = 0.95
+top_k = 20
 
-[trainer.model]
-impl = "auto"
-
-[trainer.model.ac]
-freq = 1
+[[orchestrator.eval.source]]
+name = "phy-dev"
+group_size = 4
+env.taskset.id = "phy-env"
+env.taskset.split = "dev"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
 
 [trainer.optim]
 lr = 1e-6
 
-[inference.model]
-max_model_len = 16384
-
-[inference.parallel]
-dp = 2
+[inference.vllm]
+max_model_len = 20480
+# Eval uses chat completions; without the parser a <final> written while thinking scores 0
+reasoning_parser = "qwen3"
