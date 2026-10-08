@@ -1,42 +1,53 @@
-# Small-scale smoke test — verifies the full pipeline on 20 problems.
-# Run:
-#   HF_TOKEN=<token> uv run rl @ examples/phy_rl/test.toml \
-#     --wandb.project phy-rl --wandb.name phy-rl-test-01
+# Smoke test of the full pipeline: 5 short steps on 1 trainer GPU + 1 inference GPU.
+#   uv run rl @ examples/phy_rl/test.toml --run.name phy-rl-test
 
 max_steps = 5
-seq_len = 4096
-
-[deployment]
-num_train_gpus = 2
-num_infer_gpus = 2
+seq_len = 6144
 
 [model]
 name = "Qwen/Qwen3-4B"
 
+[deployment]
+num_train_gpus = 1
+num_infer_gpus = 1
+
+[monitors.wandb]
+project = "phy-rl"
+
 [orchestrator]
 batch_size = 32
-rollouts_per_example = 4
 
-[orchestrator.sampling]
-max_tokens = 2048
-temperature = 0.7
+[orchestrator.train]
+group_size = 8
 
-[[orchestrator.env]]
-id = "phy-env"
-name = "phy-rl-test"
-args = { dataset_path = "examples/phy_rl/data_pipeline/data/final/v3/train.jsonl", dev_path = "examples/phy_rl/data_pipeline/data/final/v3/dev.jsonl", num_train = 20 }
+[orchestrator.train.sampling]
+max_completion_tokens = 4096
 
-[trainer.model]
-impl = "auto"
+[[orchestrator.train.source]]
+name = "phy-train"
+select.shuffle = true
+env.taskset.id = "phy-env"
+env.taskset.split = "train"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
 
-[trainer.model.ac]
-freq = 1
+[orchestrator.eval]
+interval = 5
+
+[orchestrator.eval.sampling]
+max_completion_tokens = 4096
+
+[[orchestrator.eval.source]]
+name = "phy-dev"
+select.limit = 16
+env.taskset.id = "phy-env"
+env.taskset.split = "dev"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
 
 [trainer.optim]
 lr = 1e-6
 
-[inference.model]
-max_model_len = 4096
-
-[inference.parallel]
-dp = 2
+[inference.vllm]
+max_model_len = 6144
+reasoning_parser = "qwen3"

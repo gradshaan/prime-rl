@@ -1,3 +1,3 @@
-from .phy_env import load_environment
+from .phy_env import PhysicsTaskset
 
-__all__ = ["load_environment"]
+__all__ = ["PhysicsTaskset"]
