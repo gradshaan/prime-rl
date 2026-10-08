@@ -9,7 +9,6 @@ from .io import read_jsonl, write_jsonl
 from .schema import Answer, FinalItem, answer_from_dict, final_item_from_dict, to_dict
 from .verifiers import extract_boxed
 
-
 ANSWER_CUE_RE = re.compile(
     r"\b("
     r"final answer|result|therefore|thus|hence|we obtain|we get|we have|by solving|is given by|"
@@ -421,14 +420,30 @@ def _proposal(
             value=value,
             unit=unit or parsed_unit,
             answer_type=answer_type,
-            tolerance=0.05 if verifier == "numeric" else None,
+            tolerance=None,
             verifier=verifier,
             equivalent_forms=[],
             subproblem_id=subproblem_id,
+            label=subproblem_id,
+            atol=_numeric_atol(value) if verifier == "numeric" else None,
+            rtol=1e-6 if verifier == "numeric" else None,
         ),
         score=score,
         evidence=evidence,
     )
+
+
+def _numeric_atol(value: str) -> float:
+    cleaned = re.sub(r"\\(?:text|mathrm|mbox)\{([^{}]*)\}", r"\1", value)
+    match = re.fullmatch(
+        r"\s*[+-]?(?P<int>\d+)(?:\.(?P<frac>\d+))?\s*(?:[eE](?P<plain_exp>[+-]?\d+)|\\times\s*10\^\{?(?P<tex_exp>[+-]?\d+)\}?)?\s*",
+        cleaned,
+    )
+    if match is None or match.group("frac") is None:
+        return 0.0
+    exponent = int(match.group("plain_exp") or match.group("tex_exp") or 0)
+    precision = len(match.group("frac"))
+    return 0.5 * 10 ** (exponent - precision)
 
 
 def _dedupe_proposals(proposals: list[AnswerProposal]) -> list[AnswerProposal]:

@@ -1,4 +1,4 @@
-"""Unit tests for the phy-env reward function and helpers."""
+"""Verifier behavior that guards the RL reward contract."""
 
 import json
 import sys
@@ -6,258 +6,240 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "phy_env"))
+sys.path.insert(0, str(Path(__file__).parents[1] / "shared"))
 
-from phy_env.phy_env import (
-    _check_answer,
-    _extract_boxed,
-    _is_valid,
-    _numbers_match,
-    _parse_number,
-    correctness_reward,
+from physics_rlvr_common import (
+    Answer,
+    validate_answer,
+    validate_release_state,
+    validate_training_policy,
+    verify_prediction,
 )
 
 
-# ---------------------------------------------------------------------------
-# _extract_boxed
-# ---------------------------------------------------------------------------
-
-
-def test_extract_boxed_simple():
-    assert _extract_boxed(r"The answer is \boxed{42}.") == ["42"]
-
-
-def test_extract_boxed_nested_fraction():
-    assert _extract_boxed(r"\boxed{\frac{3}{4}}") == [r"\frac{3}{4}"]
-
-
-def test_extract_boxed_multiple():
-    text = r"Part a: \boxed{42} and part b: \boxed{3.14}"
-    assert _extract_boxed(text) == ["42", "3.14"]
-
-
-def test_extract_boxed_empty():
-    assert _extract_boxed("No box here.") == []
-
-
-def test_extract_boxed_nested_braces():
-    text = r"\boxed{\frac{mv^2}{2r}}"
-    result = _extract_boxed(text)
-    assert result == [r"\frac{mv^2}{2r}"]
-
-
-def test_extract_boxed_with_think_tags():
-    # Qwen3 thinking mode wraps CoT in <think>...</think>
-    text = r"<think>Let me compute...</think>Therefore \boxed{9.8\,\text{m/s}^2}."
-    assert _extract_boxed(text) == [r"9.8\,\text{m/s}^2"]
-
-
-# ---------------------------------------------------------------------------
-# _parse_number
-# ---------------------------------------------------------------------------
-
-
-def test_parse_number_integer():
-    assert _parse_number("42") == pytest.approx(42.0)
-
-
-def test_parse_number_decimal():
-    assert _parse_number("3.14") == pytest.approx(3.14)
-
-
-def test_parse_number_negative():
-    assert _parse_number("-2.5") == pytest.approx(-2.5)
-
-
-def test_parse_number_scientific_braced():
-    assert _parse_number(r"2.39078 \times 10^{-15}") == pytest.approx(2.39078e-15, rel=1e-5)
-
-
-def test_parse_number_scientific_unbraced():
-    assert _parse_number(r"1.68 \times 10^-3") == pytest.approx(1.68e-3, rel=1e-5)
-
-
-def test_parse_number_with_unit_text():
-    # Units wrapped in \text{} should be stripped
-    result = _parse_number(r"9.8\,\text{m/s}^2")
-    # After stripping \text{m/s} the remainder "9.8\,^2" may not parse, that's ok
-    # — units are ignored in numeric comparison; just check it doesn't crash
-    assert result is None or isinstance(result, float)
-
-
-def test_parse_number_none_for_expression():
-    # A pure symbolic expression should return None (no numeric value)
-    result = _parse_number(r"\frac{mv^2}{r}")
-    assert result is None
-
-
-# ---------------------------------------------------------------------------
-# _numbers_match
-# ---------------------------------------------------------------------------
-
-
-def test_numbers_match_exact():
-    assert _numbers_match(42.0, 42.0)
-
-
-def test_numbers_match_within_tolerance():
-    assert _numbers_match(2.39e-15, 2.39078e-15)  # ~0.03% apart
-
-
-def test_numbers_match_outside_tolerance():
-    assert not _numbers_match(42.0, 43.0)  # ~2.3% apart — within 5%, so True
-    assert not _numbers_match(1.0, 2.0)    # 100% apart
-
-
-def test_numbers_match_zero():
-    assert _numbers_match(0.0, 0.0)
-    assert not _numbers_match(1.0, 0.0)
-
-
-# ---------------------------------------------------------------------------
-# _check_answer
-# ---------------------------------------------------------------------------
-
-
-def test_check_answer_numerical_exact():
-    assert _check_answer("42", "42", "numerical")
-
-
-def test_check_answer_numerical_scientific():
-    assert _check_answer(r"2.39 \times 10^{-15}", r"2.39078 \times 10^{-15}", "numerical")
-
-
-def test_check_answer_numerical_wrong():
-    assert not _check_answer("42", "100", "numerical")
-
-
-def test_check_answer_text_numeric():
-    assert _check_answer(r"1.68 \times 10^{-3}", r"1.68 \times 10^{-3}", "text")
-
-
-def test_check_answer_text_string_fallback():
-    assert _check_answer("yes", "yes", "text")
-    assert not _check_answer("yes", "no", "text")
-
-
-# ---------------------------------------------------------------------------
-# correctness_reward — integration tests
-# ---------------------------------------------------------------------------
-
-
-def _make_completion(text: str) -> list[dict]:
-    return [{"role": "assistant", "content": text}]
-
-
-def _make_answer(value: str, answer_type: str = "numerical") -> str:
-    return json.dumps([{"index": 0, "label": None, "raw": "", "value": value, "unit": None, "answer_type": answer_type}])
-
-
-def test_reward_correct():
-    completion = _make_completion(r"Therefore \boxed{42}.")
-    answer = _make_answer("42")
-    assert correctness_reward(completion=completion, answer=answer) == pytest.approx(1.0)
-
-
-def test_reward_correct_scientific():
-    completion = _make_completion(r"\boxed{2.39 \times 10^{-15}}")
-    answer = _make_answer(r"2.39078 \times 10^{-15}", "text")
-    assert correctness_reward(completion=completion, answer=answer) == pytest.approx(1.0)
-
-
-def test_reward_wrong():
-    completion = _make_completion(r"\boxed{100}")
-    answer = _make_answer("42")
-    assert correctness_reward(completion=completion, answer=answer) == pytest.approx(0.0)
-
-
-def test_reward_no_box():
-    completion = _make_completion("The answer is 42.")
-    answer = _make_answer("42")
-    assert correctness_reward(completion=completion, answer=answer) == pytest.approx(0.0)
-
-
-def test_reward_multipart_all_correct():
-    completion = _make_completion(r"Part a: \boxed{42} Part b: \boxed{3.14}")
-    answer = json.dumps([
-        {"index": 0, "label": "a", "raw": "", "value": "42", "unit": None, "answer_type": "numerical"},
-        {"index": 1, "label": "b", "raw": "", "value": "3.14", "unit": None, "answer_type": "numerical"},
-    ])
-    assert correctness_reward(completion=completion, answer=answer) == pytest.approx(1.0)
-
-
-def test_reward_multipart_half_correct():
-    completion = _make_completion(r"Part a: \boxed{42} Part b: \boxed{999}")
-    answer = json.dumps([
-        {"index": 0, "label": "a", "raw": "", "value": "42", "unit": None, "answer_type": "numerical"},
-        {"index": 1, "label": "b", "raw": "", "value": "3.14", "unit": None, "answer_type": "numerical"},
-    ])
-    assert correctness_reward(completion=completion, answer=answer) == pytest.approx(0.5)
-
-
-def test_reward_multipart_none_correct():
-    completion = _make_completion(r"\boxed{0} \boxed{0}")
-    answer = json.dumps([
-        {"index": 0, "label": "a", "raw": "", "value": "42", "unit": None, "answer_type": "numerical"},
-        {"index": 1, "label": "b", "raw": "", "value": "3.14", "unit": None, "answer_type": "numerical"},
-    ])
-    assert correctness_reward(completion=completion, answer=answer) == pytest.approx(0.0)
-
-
-def test_reward_with_think_tags():
-    # Qwen3 thinking output — answer should still be found after </think>
-    text = r"<think>Let me reason step by step...</think>The answer is \boxed{42}."
-    completion = _make_completion(text)
-    answer = _make_answer("42")
-    assert correctness_reward(completion=completion, answer=answer) == pytest.approx(1.0)
-
-
-def test_reward_invalid_answer_json():
-    completion = _make_completion(r"\boxed{42}")
-    assert correctness_reward(completion=completion, answer="not_json") == pytest.approx(0.0)
-
-
-# ---------------------------------------------------------------------------
-# _is_valid
-# ---------------------------------------------------------------------------
-
-
-def _make_row(source: str, question: str, structured_answers: list | None = None) -> dict:
-    if structured_answers is None:
-        structured_answers = [{"value": "42", "answer_type": "numerical"}]
-    return {"source": source, "question": question, "structured_answers": structured_answers}
-
-
-def test_is_valid_good_row():
-    row = _make_row("olympiadbench_physics", "What is the speed?")
-    assert _is_valid(row, sources=None)
-
-
-def test_is_valid_phybench_filtered():
-    row = _make_row("phybench", "A complex optics problem...")
-    assert not _is_valid(row, sources=None)
-
-
-def test_is_valid_image_filtered():
-    row = _make_row("olympiadbench_physics", "See <image_start>[problem_image_1]<image_end>")
-    assert not _is_valid(row, sources=None)
-
-
-def test_is_valid_source_filter():
-    row = _make_row("olympiadbench_physics", "What is force?")
-    assert not _is_valid(row, sources=["ipho_open_train"])
-    assert _is_valid(row, sources=["olympiadbench_physics"])
-
-
-def test_is_valid_placeholder_value_filtered():
-    row = _make_row(
-        "physics_text_reasoning_train",
-        "A rolling coin problem...",
-        structured_answers=[{"value": "2", "answer_type": "numerical"}],
+def _answer(label: str, value: str, unit: str | None = None) -> Answer:
+    return Answer(
+        label=label,
+        value=value,
+        unit=unit,
+        answer_type="numeric",
+        verifier="numeric",
+        atol=0.005,
+        rtol=1e-6,
     )
-    assert not _is_valid(row, sources=None)
 
 
-def test_is_valid_empty_answers_filtered():
-    row = _make_row("olympiadbench_physics", "What?", structured_answers=[])
-    assert not _is_valid(row, sources=None)
+def _completion(*outputs: tuple[str, str, str | None]) -> str:
+    payload = [
+        {"label": label, "value": value, "unit": unit}
+        for label, value, unit in outputs
+    ]
+    return f"Reasoning omitted. <final>{json.dumps(payload)}</final>"
+
+
+def test_multipart_reward_is_per_requested_output() -> None:
+    answers = [_answer("acceleration", "-4.27", "m/s^2"), _answer("tension", "12.67", "N")]
+
+    assert verify_prediction(_completion(("acceleration", "-4.27", "m/s^2")), answers) == 0.5
+    assert verify_prediction(
+        _completion(("acceleration", "-4.27", "m/s^2"), ("tension", "12.67", "N")), answers
+    ) == 1.0
+
+
+def test_extra_or_duplicate_output_labels_receive_zero() -> None:
+    answers = [_answer("a", "1"), _answer("b", "2")]
+
+    assert verify_prediction(_completion(("a", "1", None), ("b", "2", None), ("guess", "3", None)), answers) == 0.0
+    duplicate = '<final>[{"label":"a","value":"1","unit":null},{"label":"a","value":"2","unit":null}]</final>'
+    assert verify_prediction(duplicate, answers) == 0.0
+
+
+def test_unit_conversion_requires_matching_dimensions() -> None:
+    answers = [_answer("distance", "1000", "m")]
+
+    assert verify_prediction(_completion(("distance", "1", "km")), answers) == 1.0
+    assert verify_prediction(_completion(("distance", "1", "s")), answers) == 0.0
+    assert verify_prediction(_completion(("distance", "1000", None)), answers) == 0.0
+    optical_power = [_answer("power", "2", "1/m")]
+    assert verify_prediction(_completion(("power", "2", "dptr")), optical_power) == 1.0
+    assert verify_prediction(_completion(("power", "2", "D")), optical_power) == 0.0
+
+
+def test_symbolic_unit_conversion_preserves_scale() -> None:
+    answer = Answer(label="length", value="x", unit="m", answer_type="symbolic", verifier="sympy")
+    assert verify_prediction(_completion(("length", "100 x", "cm")), [answer]) == 1.0
+    assert verify_prediction(_completion(("length", "x", "cm")), [answer]) == 0.0
+    assert verify_prediction(_completion(("length", "x", "not-a-unit")), [answer]) == 0.0
+    capacitor = Answer(label="ratio", value=r"\frac{Ut^2}{d(2d+gt^2)}", unit="kg/C", answer_type="symbolic", verifier="sympy")
+    assert verify_prediction(_completion(("ratio", r"\frac{U t^2}{2d^2+g d t^2}", "kg/C")), [capacitor]) == 1.0
+    assert verify_prediction(_completion(("ratio", r"\frac{U t^2}{2d^2-g d t^2}", "kg/C")), [capacitor]) == 0.0
+
+
+def test_mixed_notation_preserves_powers_and_rejects_wrong_physics() -> None:
+    answer = Answer(label="pressure", value=r"2 * \nu * \mu * v^{2} / V",
+                    unit="Pa", answer_type="symbolic", verifier="sympy")
+    assert verify_prediction(_completion(("pressure", r"2 * \nu * \mu * v**2 / V", "Pa")), [answer]) == 1.0
+    assert verify_prediction(_completion(("pressure", r"4 * \nu * \mu * v**2 / V", "Pa")), [answer]) == 0.0
+    assert verify_prediction(_completion(("pressure", r"-2 * \nu * \mu * v**2 / V", "Pa")), [answer]) == 0.0
+    assert verify_prediction(_completion(("pressure", r"2 * \nu * \mu * v**2 / V", "N")), [answer]) == 0.0
+    assert verify_prediction(_completion(("pressure", "__import__('os').system('echo unsafe')", "Pa")), [answer]) == 0.0
+    decay = Answer(label="decay", value=r"\exp(-t / \tau)", unit=None, answer_type="symbolic", verifier="sympy")
+    assert verify_prediction(_completion(("decay", "exp(-t/tau)", None)), [decay]) == 1.0
+    charge = Answer(label="charge", value="e*x", unit="C", answer_type="symbolic", verifier="sympy")
+    assert verify_prediction(_completion(("charge", "e*x", "C")), [charge]) == 1.0
+
+
+def test_square_root_equivalence_requires_explicit_domain() -> None:
+    answer = Answer(label="period", value=r"2 * \pi * \sqrt{R_1^3 / (G * M)}",
+                    unit="s", answer_type="symbolic", verifier="sympy")
+    equivalent = r"2 * \pi * R_1 * \sqrt{R_1 / (G * M)}"
+    assert verify_prediction(_completion(("period", equivalent, "s")), [answer]) == 0.0
+    positive = Answer(**{**answer.__dict__, "assumptions": ["R_1 > 0", "G > 0", "M > 0"]})
+    assert verify_prediction(_completion(("period", equivalent, "s")), [positive]) == 1.0
+    assert verify_prediction(_completion(("period", r"2 * \pi * (R_1**3 / (G * M))**(1/2)", "s")), [positive]) == 1.0
+    assert verify_prediction(_completion(("period", "-" + equivalent, "s")), [positive]) == 0.0
+    unconstrained = Answer(label="root", value="sqrt(x**2)", unit=None, answer_type="symbolic", verifier="sympy")
+    assert verify_prediction(_completion(("root", "x", None)), [unconstrained]) == 0.0
+    contradictory = Answer(**{**unconstrained.__dict__, "assumptions": ["x > 0", "x < 0"]})
+    assert validate_answer(contradictory)
+
+
+def test_symbolic_temperature_conversion_uses_an_offset():
+    answer = Answer(label="temperature", value="T + 273.15", unit="K", answer_type="symbolic", verifier="sympy")
+    assert verify_prediction(_completion(("temperature", "T", "degC")), [answer]) == 1.0
+    assert verify_prediction(_completion(("temperature", "274.15*T", "K")), [answer]) == 0.0
+    fahrenheit = Answer(label="temperature", value="5*(T-32)/9", unit="degC", answer_type="symbolic", verifier="sympy")
+    assert verify_prediction(_completion(("temperature", "T", "degF")), [fahrenheit]) == 1.0
+    angle = Answer(label="angle", value=r"\pi/6", unit="rad", answer_type="symbolic", verifier="sympy")
+    assert verify_prediction(_completion(("angle", "30", "degree")), [angle]) == 1.0
+    assert verify_prediction(_completion(("angle", "60", "degree")), [angle]) == 0.0
+
+
+def test_approximation_uses_reviewed_bindings_and_a_declared_tolerance():
+    answer = Answer(label="speed", value="2e-6*c", unit="m/s", answer_type="symbolic", verifier="sympy",
+                    bindings={"alpha": "1e-6"}, rtol=2e-6)
+    exact = "c*(2*alpha+2*alpha**2)/(1+2*alpha+2*alpha**2)"
+    assert verify_prediction(_completion(("speed", exact, "m/s")), [answer]) == 1.0
+    assert verify_prediction(_completion(("speed", "-" + exact, "m/s")), [answer]) == 0.0
+    assert verify_prediction(_completion(("speed", "2*(" + exact + ")", "m/s")), [answer]) == 0.0
+    assert verify_prediction(_completion(("speed", "3e-6*c", "m/s")), [answer]) == 0.0
+    assert verify_prediction(_completion(("speed", "2e-6*c*x", "m/s")), [answer]) == 0.0
+    strict = Answer(**{**answer.__dict__, "rtol": 0})
+    assert verify_prediction(_completion(("speed", exact, "m/s")), [strict]) == 0.0
+    unspecified = Answer(**{**answer.__dict__, "bindings": {}})
+    assert verify_prediction(_completion(("speed", exact, "m/s")), [unspecified]) == 0.0
+
+
+def test_numeric_target_uses_explicit_rounding_tolerance() -> None:
+    answer = Answer(
+        label="result",
+        value="2.39e-15",
+        unit=None,
+        answer_type="numeric",
+        verifier="numeric",
+        atol=1e-18,
+        rtol=1e-4,
+    )
+
+    assert verify_prediction(_completion(("result", "2.3901e-15", None)), [answer]) == 1.0
+    assert verify_prediction(_completion(("result", "2.5e-15", None)), [answer]) == 0.0
+    threshold = _answer("coefficient", "2/3", "dimensionless")
+    assert verify_prediction(_completion(("coefficient", "0.6666666667", None)), [threshold]) == 1.0
+    assert verify_prediction(_completion(("coefficient", "-2/3", None)), [threshold]) == 0.0
+    assert verify_prediction(_completion(("coefficient", "4/3", None)), [threshold]) == 0.0
+
+
+def test_malformed_final_block_receives_zero() -> None:
+    answers = [_answer("answer", "42")]
+
+    assert verify_prediction("The answer is 42.", answers) == 0.0
+    assert verify_prediction('<final>[{"label":"answer","value":"42","unit":null,}]</final>', answers) == 0.0
+
+
+def test_latex_scientific_notation_is_checked_numerically() -> None:
+    answer = Answer(
+        label="value",
+        value=r"2.39078 \times 10^{-15}",
+        unit=None,
+        answer_type="numeric",
+        verifier="numeric",
+        atol=1e-18,
+        rtol=1e-4,
+    )
+
+    assert verify_prediction(_completion(("value", r"2.39 \times 10^{-15}", None)), [answer]) == 1.0
+
+
+def test_malformed_verifier_targets_are_rejected() -> None:
+    malformed_unit = Answer(
+        label="result",
+        value="42",
+        unit="not-a-physics-unit",
+        answer_type="numeric",
+        verifier="numeric",
+        atol=0.0,
+        rtol=1e-6,
+    )
+    malformed_value = Answer(
+        label="result",
+        value="x+",
+        unit=None,
+        answer_type="numeric",
+        verifier="numeric",
+        atol=0.0,
+        rtol=1e-6,
+    )
+
+    assert any("unit" in error for error in validate_answer(malformed_unit))
+    assert any("numeric expression" in error for error in validate_answer(malformed_value))
+    assert verify_prediction(_completion(("result", "42", "not-a-physics-unit")), [malformed_unit]) == 0.0
+
+
+def test_training_policy_blocks_benchmarks_and_post_2023_sources() -> None:
+    validate_training_policy(source="ipho_open_train", competition="IPhO", year=2023, split="train")
+
+    with pytest.raises(ValueError, match="blocked"):
+        validate_training_policy(source="ipho_open_train", competition="IPhO", year=2024, split="train")
+    with pytest.raises(ValueError, match="blocked"):
+        validate_training_policy(
+            source="olympiadbench_physics", competition="OlympiadBench Physics", year=2020, split="train"
+        )
+    with pytest.raises(ValueError, match="explicit year"):
+        validate_training_policy(source="ipho_open_train", competition="IPhO", year=None, split="train")
+    for source, competition in [("nbpho_olimpicos", "NBPhO"), ("czech_physics_olympiad", "Czech Physics Olympiad")]:
+        validate_training_policy(source=source, competition=competition, year=2023, split="train")
+        with pytest.raises(ValueError, match="explicit year"):
+            validate_training_policy(source=source, competition=competition, year=None, split="train")
+        with pytest.raises(ValueError, match="blocked"):
+            validate_training_policy(source=source, competition=competition, year=2024, split="train")
+    with pytest.raises(ValueError, match="integer"):
+        validate_training_policy(source="ipho_open_train", competition="IPhO", year=True, split="train")
+    with pytest.raises(ValueError, match="blocked"):
+        validate_training_policy(
+            source="estonian_physics_olympiad", competition="Estonian Physics Olympiad", year=2019, split="train"
+        )
+
+
+def test_physics_dataset_is_blocked_as_a_training_source() -> None:
+    for source in ["physics_training_release", "desimfj/PHYSICS", "PHYSICS_test",
+                   "Darkyy/phy-rl-base", "darkyy_phy_rl_base", "phy_rl_base"]:
+        for source_split in ["train", "test", None]:
+            with pytest.raises(ValueError, match="blocked"):
+                validate_training_policy(
+                    source=source, competition="PHYSICS", year=None, split="train",
+                    source_split=source_split, source_revision="a" * 64,
+                )
+    for repository in ["Darkyy/phy-rl-base", "desimfj/PHYSICS"]:
+        with pytest.raises(ValueError, match="blocked in source provenance"):
+            validate_release_state({"problem_id": "relabeled", "source": "ipho_open_train",
+                                    "provenance": {"source_url": f"https://huggingface.co/datasets/{repository}/viewer/default/train"}})
+
+
+def test_staged_records_cannot_enter_training() -> None:
+    validate_release_state({"problem_id": "released", "status": "accepted", "release_status": "ready", "checks": {"units": True}})
+    with pytest.raises(ValueError, match="not released"):
+        validate_release_state({"problem_id": "pilot", "status": "model_checked", "release_status": "staging_only"})
+    with pytest.raises(ValueError, match="review status"):
+        validate_release_state({"problem_id": "pilot", "status": "review", "release_status": "ready"})
+    with pytest.raises(ValueError, match="failed validation"):
+        validate_release_state({"problem_id": "pilot", "release_status": "ready", "checks": {"units": False}})

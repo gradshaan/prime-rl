@@ -5,6 +5,9 @@ description = "Physics RLVR environment for prime-rl"
 requires-python = ">=3.12"
 dependencies = [
     "datasets",
+    "physics-rlvr-common",
     "verifiers",
-    "sympy",
 ]
+
+[tool.uv.sources]
+physics-rlvr-common = { path = "../shared", editable = true }

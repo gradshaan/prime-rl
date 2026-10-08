@@ -1,35 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
-AnswerType = Literal[
-    "numeric",
-    "numerical",
-    "symbolic",
-    "expression",
-    "multiple_choice",
-    "multi_select",
-    "set",
-    "tuple",
-    "interval",
-    "string",
-    "string_exact",
-]
-
-VerifierType = Literal[
-    "numeric",
-    "sympy",
-    "expression",
-    "mcq",
-    "multi_select",
-    "set",
-    "tuple",
-    "interval",
-    "string",
-    "string_exact",
-    "custom",
-]
+from physics_rlvr_common import Answer, validate_answer
+from physics_rlvr_common.verifier import answer_from_dict as _common_answer_from_dict
 
 PaperType = Literal["problem", "solution", "marking_scheme", "unknown"]
 Split = Literal["train", "dev", "frozen_test"]
@@ -49,6 +24,8 @@ class SourceManifestItem:
     license_status: str = "unknown"
     problem_number: str | None = None
     split: Split | None = None
+    round: str | None = None
+    paper_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -84,23 +61,17 @@ class ExtractedDocument:
 
 
 @dataclass(frozen=True)
-class Answer:
-    value: str
-    unit: str | None
-    answer_type: AnswerType
-    tolerance: float | str | None
-    verifier: VerifierType
-    equivalent_forms: list[str] = field(default_factory=list)
-    subproblem_id: str | None = None
-
-
-@dataclass(frozen=True)
 class Provenance:
     pdf_url: str | None
     page_range: list[int] | None
     ocr_engine: str | None
     ocr_confidence: float | None
     source_hash: str
+    solution_hash: str | None = None
+    license_status: str = "unknown"
+    source_split: str | None = None
+    source_revision: str | None = None
+    source_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +91,9 @@ class FinalItem:
     language: str
     split: Split
     provenance: Provenance
+    family_id: str | None = None
+    topic: str | None = None
+    difficulty: float | str | None = None
 
 
 @dataclass(frozen=True)
@@ -136,15 +110,7 @@ def to_dict(value: Any) -> dict[str, Any]:
 
 
 def answer_from_dict(raw: dict[str, Any]) -> Answer:
-    return Answer(
-        value=str(raw.get("value", "")),
-        unit=raw.get("unit"),
-        answer_type=raw.get("answer_type", "string"),
-        tolerance=raw.get("tolerance"),
-        verifier=raw.get("verifier", "string"),
-        equivalent_forms=list(raw.get("equivalent_forms", [])),
-        subproblem_id=raw.get("subproblem_id"),
-    )
+    return _common_answer_from_dict(raw)
 
 
 def final_item_from_dict(raw: dict[str, Any]) -> FinalItem:
@@ -164,8 +130,11 @@ def final_item_from_dict(raw: dict[str, Any]) -> FinalItem:
         answers=answers,
         requires_diagram=bool(raw.get("requires_diagram", False)),
         language=raw.get("language", "en"),
-        split=raw["split"],
+        split=raw.get("split", "train"),
         provenance=provenance,
+        family_id=raw.get("family_id"),
+        topic=raw.get("topic"),
+        difficulty=raw.get("difficulty"),
     )
 
 
@@ -174,6 +143,7 @@ def validate_final_item(item: FinalItem) -> list[str]:
     required_text = {
         "problem_id": item.problem_id,
         "source": item.source,
+        "competition": item.competition,
         "problem_text": item.problem_text,
         "question": item.question,
         "official_solution": item.official_solution,
@@ -186,17 +156,19 @@ def validate_final_item(item: FinalItem) -> list[str]:
         errors.append("language must be en")
     if item.requires_diagram:
         errors.append("requires_diagram must be false for admitted items")
-    if item.split not in {"train", "dev", "frozen_test"}:
-        errors.append("split must be train, dev, or frozen_test")
+    if item.split not in {"train", "dev"}:
+        errors.append("split must be train or dev")
     if not item.answers:
         errors.append("answers is empty")
     for index, answer in enumerate(item.answers):
-        if not answer.value.strip():
-            errors.append(f"answers[{index}].value is empty")
-        if answer.answer_type in {"numeric", "numerical"} and answer.verifier != "numeric":
-            errors.append(f"answers[{index}] numeric answer must use numeric verifier")
-        if answer.answer_type in {"symbolic", "expression"} and answer.verifier not in {"sympy", "expression"}:
-            errors.append(f"answers[{index}] symbolic answer must use sympy or expression verifier")
+        errors.extend(f"answers[{index}].{error}" for error in validate_answer(answer, require_label=True))
+    labels = [answer.output_label for answer in item.answers]
+    if len(labels) != len(set(labels)):
+        errors.append("answer labels must be unique")
+    if not item.provenance.source_hash:
+        errors.append("provenance.source_hash is empty")
+    if not item.provenance.solution_hash:
+        errors.append("provenance.solution_hash is empty")
     return errors
 
 
@@ -206,6 +178,8 @@ def problem_artifact_id(item: SourceManifestItem) -> str:
         item.competition or "unknown_competition",
         str(item.year or "unknown_year"),
         item.problem_number or "unknown_problem",
+        item.round or "unknown_round",
+        item.paper_id or "unknown_paper",
         item.paper_type,
         item.sha256[:12],
     ]

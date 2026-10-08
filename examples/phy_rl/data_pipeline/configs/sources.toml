@@ -1,24 +1,234 @@
-[source.ipho_olimpicos]
-source_type = "olympiad_pdf"
-base_url = "https://ipho.olimpicos.net/"
-competitions = ["IPhO", "APhO", "EuPhO", "NBPhO", "RMPh", "WoPhO"]
+[source.ipho_archive]
+source_type = "olympiad_archive"
+base_url = "https://www.ipho-new.org/documentations/"
+competition = "IPhO"
 include_year_max = 2023
-frozen_test_years = [2024, 2025]
 require_solution = true
-license_status = "unknown"
+language = "en"
 
-[source.physics_dataset]
-source_type = "structured_dataset"
-repo = "https://github.com/Zhengsh123/PHYSICS"
-include_split = "train"
-exclude_split = "test"
-license_status = "unknown"
+[source.russian_physics_olympiad]
+source_type = "olympiad_archive"
+base_url = "https://olimpiada.ru/activity/74/tasks"
+competition = "RussianPhysicsOlympiad"
+include_year_min = 2010
+include_year_max = 2023
+require_solution = true
+language = "ru"
 
-[source.olympiadbench]
-source_type = "structured_dataset"
-repo = "https://github.com/OpenBMB/OlympiadBench"
-subject = "physics"
-modality = "text"
-proof = false
-optional = true
-license_status = "unknown"
+[source.ipho_olimpicos]
+source_type = "olympiad_archive_mirror"
+base_url = "https://olimpicos.net/ipho/"
+competition = "IPhO"
+include_year_max = 2023
+require_solution = true
+language = "en"
+
+[source.ipho_open_train]
+source_type = "olympiad_archive"
+competition = "IPhO"
+include_year_max = 2023
+require_solution = true
+language = "en"
+
+[source.apho_archive]
+source_type = "olympiad_archive"
+base_url = "https://olimpicos.net/apho/"
+competition = "APhO"
+include_year_max = 2023
+require_solution = true
+language = "en"
+
+[source.eupho_archive]
+source_type = "olympiad_archive"
+base_url = "https://eupho.ee/archive/"
+competition = "EuPhO"
+include_year_max = 2023
+require_solution = true
+language = "en"
+
+[source.nbpho_archive]
+source_type = "olympiad_archive"
+base_url = "https://nbpho.ee/archive/"
+competition = "NBPhO"
+include_year_max = 2023
+require_solution = true
+language = "en"
+
+[source.nbpho_olimpicos]
+source_type = "olympiad_archive_mirror"
+base_url = "https://olimpicos.net/nbpho/"
+competition = "NBPhO"
+include_year_max = 2023
+require_solution = true
+language = "en"
+
+[source.usapho_archive]
+source_type = "olympiad_archive"
+base_url = "https://www.aapt.org/physicsteam/PT-exams.cfm"
+competition = "USAPhO"
+include_year_max = 2023
+require_solution = true
+language = "en"
+
+[source.usapho_training_camp]
+source_type = "training_archive"
+base_url = "https://www.aapt.org/physicsteam/PT-exams.cfm"
+competition = "USAPhO training camp"
+include_year_max = 2023
+require_solution = true
+language = "en"
+
+[source.inpho_archive]
+source_type = "olympiad_archive"
+base_url = "https://olympiads.hbcse.tifr.res.in/how-to-prepare/past-papers/"
+competition = "INPhO"
+include_year_max = 2023
+require_solution = true
+language = "en"
+
+[source.knzhou_handouts]
+source_type = "solved_handouts"
+base_url = "https://knzhou.github.io/"
+competition = "Kevin Zhou handouts"
+include_year_max = 2023
+require_solution = true
+language = "en"
+
+[source.zhou_handouts]
+source_type = "solved_handouts"
+base_url = "https://knzhou.github.io/"
+competition = "Kevin Zhou handouts"
+include_year_max = 2023
+require_solution = true
+language = "en"
+
+[source.kalda_latex]
+source_type = "latex_repository"
+base_url = "https://github.com/physoly/physoly-latex"
+competition = "Kalda handouts"
+include_year_max = 2023
+require_solution = true
+language = "en"
+
+[source.estonian_physics_olympiad]
+source_type = "latex_repository"
+base_url = "https://github.com/Majakas/physics-collection"
+competition = "Estonian Physics Olympiad"
+include_year_min = 2004
+include_year_max = 2018
+require_solution = true
+language = "en"
+
+[source.opho_archive]
+source_type = "olympiad_archive"
+base_url = "https://opho.physoly.org/rankings"
+competition = "OPhO"
+include_year_max = 2023
+require_solution = true
+language = "en"
+
+[source.wopho_archive]
+source_type = "olympiad_archive"
+base_url = "https://olimpicos.net/wopho/"
+competition = "WoPhO"
+include_year_max = 2023
+require_solution = true
+language = "en"
+
+[source.physics_cup_archive]
+source_type = "olympiad_archive"
+base_url = "https://physicscup.ee/archive/"
+competition = "Physics Cup"
+include_year_max = 2023
+require_solution = true
+language = "en"
+
+[source.physics_naboj_archive]
+source_type = "olympiad_archive"
+base_url = "https://physics.naboj.org/sk/en/archive/"
+competition = "Physics Naboj"
+include_year_max = 2023
+require_solution = true
+language = "en"
+
+[source.australian_physics_olympiad]
+source_type = "olympiad_archive"
+base_url = "https://asi.edu.au/program/australian-science-olympiads/past-exams-with-answers/physics-olympiad-past-exams/"
+competition = "Australian Physics Olympiad"
+include_year_max = 2023
+require_solution = true
+language = "en"
+
+[source.czech_physics_olympiad]
+source_type = "olympiad_archive"
+base_url = "https://fyzikalniolympiada.cz/archiv/zadani-a-reseni"
+competition = "Czech Physics Olympiad"
+include_year_max = 2023
+require_solution = true
+language = "cs"
+
+[source.physics_book_davidmorin_en]
+source_type = "textbook"
+competition = "David Morin"
+require_solution = true
+language = "en"
+
+[source.physics_book_kittel_en]
+source_type = "textbook"
+competition = "Kittel"
+require_solution = true
+language = "en"
+
+[source.physics_book_irodov_en]
+source_type = "textbook"
+competition = "Irodov"
+require_solution = true
+language = "en"
+
+[source.grad_written_exam_physics]
+source_type = "written_exam"
+competition = "Graduate physics written exam"
+require_solution = true
+language = "en"
+
+[source.openstax_university_physics]
+source_type = "open_textbook"
+base_url = "https://openstax.org/books/university-physics-volume-3"
+competition = "OpenStax University Physics"
+require_solution = true
+language = "en"
+
+[source.textbookreasoning_physics]
+source_type = "physics_training_dataset"
+competition = "TextbookReasoning physics training material"
+base_url = "https://huggingface.co/datasets/MegaScience/TextbookReasoning"
+require_solution = true
+language = "en"
+accepted_source_splits = ["train"]
+accepted_revisions = ["ca7ecbec76d01bff2e99f3dc17735b02f87d4e96"]
+
+[source.nemotron_rl_science_physics]
+source_type = "physics_training_dataset"
+competition = "Physics Stack Exchange training material"
+base_url = "https://huggingface.co/datasets/nvidia/Nemotron-RL-Science-v1"
+require_solution = true
+language = "en"
+accepted_source_splits = ["so_openq"]
+accepted_revisions = ["cc485d0ec5b53d430a43c756db0a4d6f00dc4cee"]
+
+[source.savchenko_solutions]
+source_type = "textbook_worked_solutions"
+competition = "Savchenko Problems in Physics"
+base_url = "https://savchenko-physics.github.io/"
+require_solution = true
+language = "en"
+accepted_source_splits = ["training_material"]
+accepted_revisions = ["148ff8c47b99b0edf5e00d1a79d3a1e71a6e6ed4"]
+
+[source.physoly_mirror]
+source_type = "olympiad_archive"
+base_url = "https://github.com/physoly/OPhO/tree/2c4128b838eef83daece1b96dd72b3e275e85b17/app/static/files/archive"
+competition = "National olympiads mirrored by physoly"
+include_year_max = 2023
+require_solution = true
+language = "en"

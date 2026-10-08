@@ -24,8 +24,7 @@ temperature = 0.7
 [[orchestrator.env]]
 id = "phy-env"
 name = "phy-rl-test"
-# olympiadbench: single-part, clean numeric answers, no images — ideal for testing
-args = { num_train = 20, num_eval = 5, sources = "olympiadbench_physics" }
+args = { dataset_path = "examples/phy_rl/data_pipeline/data/final/v3/train.jsonl", dev_path = "examples/phy_rl/data_pipeline/data/final/v3/dev.jsonl", num_train = 20 }
 
 [trainer.model]
 impl = "auto"
